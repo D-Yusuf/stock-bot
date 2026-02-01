@@ -1,0 +1,11 @@
+Prompt: what day is today.. and please what are news about nvidia/google/apple, are they expected to go up by atleast 7-12% in the next 2-4 months or no and why?? also why is microsoft dowsn over 10% last week?
+Today is February 1, 2026.
+
+**Nvidia:** Strong AI demand; analysts predict 20-41% stock rise in 2026 (potentially exceeding 7-12% in 2-4 months) due to $350B+ revenue forecasts and hyperscaler capex.
+
+**Google (Alphabet):** Cooling enthusiasm amid slowing Mag7 growth; 18% profit rise expected, but short-term gains uncertain, likely under 7%.
+
+**Apple:** Stable but modest outlook; analysts see ~4% gain, not reaching 7-12% soon due to AI payoff doubts.
+
+Microsoft dropped ~10% last week on Q2 earnings: Azure growth stalled at 37-38%, heavy OpenAI investments questioned, despite beating estimates.
+--------------
