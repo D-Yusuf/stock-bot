@@ -1,320 +1,161 @@
 import asyncio
-import os
-import json
-import re
-from dotenv import load_dotenv
-from ib_async import * # Modern library for Python 3.14
-from openai import OpenAI
-import time
-import logging
 import datetime
-
-# Configure Logging
-logging.basicConfig(
-    filename='bot_activity.log',
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+from config import IB_HOST, IB_PORT, load_config, create_context
+from logger import log
+from helpers import (
+    is_market_open, shutdown_requested, start_keyboard_listener,
+    next_market_open_secs, kuwait_time_str, is_eod_close_window, is_friday_eod,
 )
-
-# 1. SETUP
-load_dotenv()
-XAI_KEY = os.getenv("XAI_API_KEY")
-IB_PORT = int(os.getenv("IBKR_PORT", 7497))
-IB_ACC = os.getenv("IBKR_ACCOUNT")
-
-client = OpenAI(api_key=XAI_KEY, base_url="https://api.x.ai/v1")
-ib = IB()
-
-def log_event(message, level="info"):
-    print(message)
-    if level == "info": logging.info(message)
-    elif level == "error": logging.error(message)
-    elif level == "warning": logging.warning(message)
+from account import get_total_capital
+from risk import RiskGuard
+from strategy import get_grok_strategy
+from trading import trade_rebalance, close_all_positions, check_for_stopouts
 
 
-# 2. DATA SANITIZER (Protects your account details from AI training)
-def sanitize_text(text):
-    text = re.sub(r'[Uu]\d{4,10}', '[ACCOUNT_ID]', text)
-    text = re.sub(r'\$?\d{1,3}(,\d{3})*(\.\d+)?', '[AMOUNT]', text)
-    return text
-
-# 3. GET TOTAL CAPITAL (NLV)
-async def get_total_capital():
-    # ib.accountValues() is an async call in this library
-    for v in ib.accountValues():
-        if v.tag == 'NetLiquidation' and v.currency == 'USD' and v.account == IB_ACC:
-            return float(v.value)
-    return 0.0
-
-# 4. GROK STRATEGY ANALYST
-async def get_grok_strategy(watchlist, history=None):
-    log_event(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] SEARCHING WEB & X: Analyzing sentiment for {', '.join(watchlist)}...")
-    
-    # Read dynamic instructions from file
-    user_instructions = ""
-    if os.path.exists("bot_instructions.txt"):
-        with open("bot_instructions.txt", "r") as f:
-            user_instructions = f.read().strip()
-            if user_instructions:
-                log_event(f"Applying User Instructions: {user_instructions}")
-
-    prompt = f"""
-    Analyze live news for {', '.join(watchlist)} using X (Twitter) and web search.
-    Today is {datetime.datetime.now().strftime('%b %d, %Y')}.
-    
-    USER OVERRIDE INSTRUCTIONS:
-    {user_instructions}
-    
-    You MUST return a JSON object with two fields:
-    1. "reasoning": A concise list of bullet points explaining your decision. Cite sources like "(via X)" or "(via Web)".
-    2. "allocation": A dictionary with the percentages for each stock (must sum to roughly 100%).
-    
-    Example JSON structure:
-    {{
-        "reasoning": "- GOOGL up on earnings leak (via X)\\n- AAPL neutral, waiting for event (via Web)",
-        "allocation": {{'NVDA': 10, 'GOOGL': 50, 'AAPL': 40}}
-    }}
-    """
-    
-    try:
-        messages = []
-        if history is not None:
-            messages = history
-            messages.append({"role": "user", "content": sanitize_text(prompt)})
-        else:
-            messages = [{"role": "user", "content": sanitize_text(prompt)}]
-
-        response = client.chat.completions.create(
-            # model="grok-3", # Switching to a known stable model identifier
-            messages=messages,
-            # extra_body={"search_parameters": {"mode": "on"}} # Enable if needed for specific models
-        )
-        
-        # Grok will now execute the search server-side and return the final answer
-        content = response.choices[0].message.content
-        
-        if history is not None:
-            history.append({"role": "assistant", "content": content})
-
-        match = re.search(r'\{.*\}', content, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
-            # Handle both old format (direct dict) and new format (nested dict)
-            if "allocation" in data:
-                reasoning = data.get('reasoning', 'No reasoning provided.')
-                log_event(f"GROK REASONING: {reasoning}")
-                return data["allocation"]
-            else:
-                return data
-        return None
-    except Exception as e:
-        log_event(f"Agent API Error: {e}", "error")
-        # Debugging: Print full response if possible or raw error
-        if 'response' in locals():
-            print(f"Raw Response: {response}")
-        return None
-# 5. EXECUTE REBALANCE (BRACKET ORDERS)
-import time
-import asyncio
-from ib_async import *
-
-async def trade_rebalance(strategy):
-    # Refresh positions
-    positions = await ib.reqPositionsAsync()
-    current_positions = {p.contract.symbol: p.position for p in positions}
-    
-    total_val = await get_total_capital() * 0.98 
-    log_event(f"Rebalancing with LIVE DATA and URGENT ALGO (Equity: ${total_val:.2f})...")
-
-    for ticker, percentage in strategy.items():
-        if ticker not in ["NVDA", "GOOGL", "AAPL"]: continue
-        
-        target_amt = (percentage / 100) * total_val
-        contract = Stock(ticker, 'SMART', 'USD')
-        await ib.qualifyContractsAsync(contract)
-        
-        # 1. FORCE LIVE DATA MODE
-        ib.reqMarketDataType(1) 
-        [ticker_data] = await ib.reqTickersAsync(contract)
-        price = ticker_data.marketPrice() or ticker_data.last
-        
-        target_qty = int(target_amt / price)
-        current_qty = current_positions.get(ticker, 0)
-        delta_qty = target_qty - current_qty
-        
-        if delta_qty > 0:
-            log_event(f"URGENT BUY: {ticker} (+{delta_qty} shares)")
-            
-            # 2. THE SPEED UP: Use Adaptive Algo
-            buy_order = MarketOrder('BUY', delta_qty, account=IB_ACC)
-            buy_order.algoStrategy = 'Adaptive'
-            buy_order.algoParams = [TagValue('priority', 'Urgent')] # Aggressive fill
-            buy_order.tif = 'GTC'
-            buy_order.transmit = True 
-            
-            trade = ib.placeOrder(contract, buy_order)
-            
-            # Wait for fill (Should be much faster now)
-            start_wait = time.time()
-            while not trade.isDone() and (time.time() - start_wait < 20):
-                await asyncio.sleep(0.2) # Faster polling
-            
-            if trade.isDone() and trade.orderStatus.status == 'Filled':
-                log_event(f"SUCCESS: {ticker} filled instantly. Attaching Stop Loss.")
-                # Attach Protection
-                sl = StopOrder('SELL', delta_qty, round(price * 0.93, 2), account=IB_ACC, tif='GTC')
-                tp = LimitOrder('SELL', delta_qty, round(price * 1.15, 2), account=IB_ACC, tif='GTC')
-                ib.placeOrder(contract, sl)
-                ib.placeOrder(contract, tp)
-
-        elif delta_qty < -1:
-            log_event(f"URGENT SELL: {ticker} (-{abs(delta_qty)})")
-            sell_order = MarketOrder('SELL', abs(delta_qty), account=IB_ACC, tif='GTC')
-            sell_order.algoStrategy = 'Adaptive'
-            sell_order.algoParams = [TagValue('priority', 'Urgent')]
-            ib.placeOrder(contract, sell_order)
-    # 1. Refresh positions
-    positions = await ib.reqPositionsAsync()
-    current_positions = {p.contract.symbol: p.position for p in positions}
-    
-    total_val = await get_total_capital() * 0.98 
-    log_event(f"Rebalancing Cash Account (Equity: ${total_val:.2f})...")
-
-    for ticker, percentage in strategy.items():
-        if ticker not in ["NVDA", "GOOGL", "AAPL"]: continue
-        
-        target_amt = (percentage / 100) * total_val
-        contract = Stock(ticker, 'SMART', 'USD')
-        await ib.qualifyContractsAsync(contract)
-        
-        # Get live price
-        ib.reqMarketDataType(1) 
-        [ticker_data] = await ib.reqTickersAsync(contract)
-        price = ticker_data.marketPrice() or ticker_data.last
-        
-        target_qty = int(target_amt / price)
-        current_qty = current_positions.get(ticker, 0)
-        delta_qty = target_qty - current_qty
-        
-        # --- CASH ACCOUNT BUY LOGIC ---
-        if delta_qty > 0:
-            log_event(f"CASH BUY: Sending {ticker} (+{delta_qty} shares)")
-            
-            # Place only the BUY order first
-            buy_order = MarketOrder('BUY', delta_qty, account=IB_ACC)
-            buy_order.tif = 'GTC' # Fixes the 10349 Preset Error
-            buy_order.transmit = True 
-            
-            trade = ib.placeOrder(contract, buy_order)
-            
-            # WAIT FOR FILL (Max 30 seconds)
-            log_event(f"Waiting for {ticker} fill to avoid short-sale rejection...")
-            start_wait = time.time()
-            while not trade.isDone() and time.time() - start_wait < 30:
-                await asyncio.sleep(1)
-            
-            if trade.isDone() and trade.orderStatus.status == 'Filled':
-                log_event(f"FILLED. Attaching Protection (Stop: 7%, Profit: 15%).")
-                
-                # Protect the shares we now actually own
-                sl = StopOrder('SELL', delta_qty, round(price * 0.93, 2), account=IB_ACC, tif='GTC')
-                tp = LimitOrder('SELL', delta_qty, round(price * 1.15, 2), account=IB_ACC, tif='GTC')
-                
-                # These are sent separately but since we have the shares, they won't reject.
-                ib.placeOrder(contract, sl)
-                ib.placeOrder(contract, tp)
-            else:
-                log_event(f"BUY order for {ticker} did not fill. Skipping protection.", "warning")
-
-        # --- REDUCE POSITION (SELL) ---
-        elif delta_qty < -1:
-            log_event(f"CASH SELL: Reducing {ticker} by {abs(delta_qty)} shares")
-            sell_order = MarketOrder('SELL', abs(delta_qty), account=IB_ACC, tif='GTC')
-            ib.placeOrder(contract, sell_order)
-    # 1. CANCEL ALL EXISTING OPEN ORDERS FOR OUR WATCHLIST
-    # This prevents 'Double Buying' or orders getting stuck in TWS
-    log_event("Cleaning up existing open orders...")
-    trades = await ib.reqAllOpenOrdersAsync()
-    for t in trades:
-        if t.contract.symbol in ["NVDA", "GOOGL", "AAPL"]:
-            ib.cancelOrder(t.order)
-    
-    # 2. GET CURRENT POSITIONS
-    positions = await ib.reqPositionsAsync()
-    current_positions = {p.contract.symbol: p.position for p in positions}
-    
-    total_val = await get_total_capital() * 0.98 # 2% cash buffer
-    log_event(f"Rebalancing Portfolio (Total Equity: ${total_val:.2f})...")
-
-    for ticker, percentage in strategy.items():
-        if ticker not in ["NVDA", "GOOGL", "AAPL"]: continue
-        
-        target_amt = (percentage / 100) * total_val
-        contract = Stock(ticker, 'SMART', 'USD')
-        await ib.qualifyContractsAsync(contract)
-        
-        # 3. GET LIVE MARKET PRICE
-        ib.reqMarketDataType(1) # Live
-        [ticker_data] = await ib.reqTickersAsync(contract)
-        price = ticker_data.marketPrice() or ticker_data.last or ticker_data.close
-        
-        if price != price or price <= 0:
-             log_event(f"SKIPPING {ticker}: Invalid price data.", "warning")
-             continue
-
-        # 4. CALCULATE DELTA (What we have vs What we want)
-        target_qty = int(target_amt / price)
-        current_qty = current_positions.get(ticker, 0)
-        delta_qty = target_qty - current_qty
-        
-        # 5. EXECUTE WITH FULL TRANSMISSION
-        if abs(delta_qty) >= 1:
-            if delta_qty > 0:
-                # BUY: Bracket Order (Parent + Stop Loss)
-                log_event(f"BUYING {delta_qty} of {ticker}...")
-                parent = MarketOrder('BUY', delta_qty, account=IB_ACC)
-                parent.transmit = False # Hold until SL is attached
-                
-                stop_loss = StopOrder('SELL', delta_qty, round(price * 0.93, 2), account=IB_ACC)
-                stop_loss.parentId = parent.orderId
-                stop_loss.transmit = True # THIS TRIGER THE ACTUAL TRADE
-                
-                ib.placeOrder(contract, parent)
-                ib.placeOrder(contract, stop_loss)
-            
-            else:
-                # SELL: Direct Market Sell to reduce position
-                log_event(f"SELLING {abs(delta_qty)} of {ticker}...")
-                sell_order = MarketOrder('SELL', abs(delta_qty), account=IB_ACC)
-                sell_order.transmit = True
-                ib.placeOrder(contract, sell_order)
-        else:
-             log_event(f"STABLE: {ticker} (No action needed)")
-# 6. MAIN ENGINE
 async def main():
+    import helpers  # for mutating shutdown_requested
+
+    ctx = create_context()
+    start_keyboard_listener()
+
+    log(f"Connecting to IBKR at {IB_HOST}:{IB_PORT}...")
+    await ctx.ib.connectAsync(IB_HOST, IB_PORT, clientId=15, timeout=60)
+    log("Connected.")
+    log(f"Press  x + Enter  to safely shut down.\n")
+
+    cfg = load_config()
+    starting_equity = await get_total_capital(ctx)
+    risk = RiskGuard(
+        starting_equity,
+        cfg["risk"]["daily_loss_limit_pct"],
+        cfg["risk"]["cooldown_cycles_after_stopout"],
+    )
+    current_day = datetime.date.today()
+    log(f"Risk guard | equity: ${starting_equity:,.2f} | "
+        f"loss limit: ${risk.loss_limit:,.2f} ({cfg['risk']['daily_loss_limit_pct']*100:.0f}%)")
+
+    prev_positions = {p.contract.symbol: p.position
+                      for p in await ctx.ib.reqPositionsAsync()}
+
+    # Start Telegram bot if configured
+    tg = None
     try:
-        log_event(f"Connecting to IBKR on port {IB_PORT}...")
-        await ib.connectAsync('127.0.0.1', IB_PORT, clientId=15, timeout=60)
-        
-        watchlist = ["NVDA", "GOOGL", "AAPL"]
-        
-        while True:
-            log_event("\n--- STARTING 5-MINUTE CYCLE ---")
-            
-            # Check market news/status via Grok
-            strategy = await get_grok_strategy(watchlist)
-            
-            if strategy:
-                await trade_rebalance(strategy)
-            
-            log_event("Cycle complete. Sleeping for 1 minute...")
-            await asyncio.sleep(300) # 300 seconds = 5 minutes
-            
+        from telegram_bot import TelegramBot
+        tg = TelegramBot(ctx, risk)
+        await tg.start()
+        log("Telegram bot started.")
     except Exception as e:
-        log_event(f"Bot Error: {e}", "error")
+        log(f"Telegram bot not started: {e}")
+
+    conversation: list = []
+
+    try:
+        while True:
+            if helpers.shutdown_requested:
+                await close_all_positions(ctx, cfg["watchlist"], "user pressed x")
+                break
+
+            cfg        = load_config()
+            watchlist  = cfg["watchlist"]
+            cycle_secs = cfg["timing"]["cycle_seconds"]
+
+            cycle_start = datetime.datetime.now()
+            log(f"\n{'=' * 60}")
+            log(f"CYCLE  {cycle_start:%Y-%m-%d %H:%M:%S}")
+            log(f"{'=' * 60}")
+
+            # New trading day reset
+            if datetime.date.today() != current_day:
+                current_day = datetime.date.today()
+                new_equity  = await get_total_capital(ctx)
+                risk.reset(new_equity)
+                conversation = []
+
+            risk.tick_cooldowns()
+            prev_positions = await check_for_stopouts(ctx, risk, prev_positions, watchlist)
+
+            if not is_market_open():
+                secs_left = next_market_open_secs()
+                while secs_left > 0:
+                    if helpers.shutdown_requested:
+                        break
+                    h, rem = divmod(secs_left, 3600)
+                    m, s   = divmod(rem, 60)
+                    print(f"\r  Market closed | Kuwait: {kuwait_time_str()}  |  "
+                          f"Opens in {h:02d}:{m:02d}:{s:02d}  ", end="", flush=True)
+                    await asyncio.sleep(1)
+                    secs_left -= 1
+                print()
+                continue
+
+            else:
+                from account import get_available_cash
+
+                eod_cfg     = cfg.get("eod", {})
+                close_mins  = eod_cfg.get("close_minutes_before", 15)
+
+                # EOD close — 15 min before market close on any day
+                if eod_cfg.get("close_all_eod") and is_eod_close_window(close_mins):
+                    log("  EOD window — closing all positions before market close.")
+                    await close_all_positions(ctx, watchlist, "end of day")
+                    risk.reset(await get_total_capital(ctx))
+                    log(f"Cycle done. Sleeping {cfg['timing']['cycle_seconds']}s...")
+                    await asyncio.sleep(cfg["timing"]["cycle_seconds"])
+                    continue
+
+                # Friday hard close — no weekend risk
+                if eod_cfg.get("close_all_friday") and is_friday_eod(close_mins):
+                    log("  Friday EOD — closing all positions, no weekend holds.")
+                    await close_all_positions(ctx, watchlist, "Friday close")
+                    risk.reset(await get_total_capital(ctx))
+                    log(f"Cycle done. Sleeping {cfg['timing']['cycle_seconds']}s...")
+                    await asyncio.sleep(cfg["timing"]["cycle_seconds"])
+                    continue
+
+                available_cash = await get_available_cash(ctx)
+                cap_usd        = cfg["risk"].get("portfolio_cap_usd")
+                max_deploy     = cfg["risk"].get("max_deploy_pct", 0.70)
+
+                # Apply 70% deploy cap and portfolio USD cap
+                investable = available_cash * (1.0 - cfg["risk"]["cash_buffer_pct"])
+                investable = investable * max_deploy
+                if cap_usd:
+                    investable = min(investable, cap_usd)
+
+                free_budget = max(0.0, investable - risk.cash_deployed)
+                log(f"  Budget: ${investable:.0f} cap ({int(max_deploy*100)}% deploy) | "
+                    f"${risk.cash_deployed:.0f} deployed | ${free_budget:.0f} free")
+
+                MIN_BUY_BUDGET = 150.0
+                scan_budget = free_budget if free_budget >= MIN_BUY_BUDGET else 0.0
+
+                if scan_budget == 0.0:
+                    log("  No free cash to buy — running Grok in analysis-only mode (manage existing positions).")
+
+                raw = await get_grok_strategy(ctx, watchlist, conversation, cfg, scan_budget)
+
+                if raw:
+                    reasoning = raw.pop("_reasoning", [])
+                    await trade_rebalance(ctx, raw, risk, cfg, reasoning)
+                else:
+                    log("  No actionable signal.")
+                    await trade_rebalance(ctx, {}, risk, cfg, [])
+
+            log(f"Cycle done. Sleeping {cycle_secs}s...")
+            await asyncio.sleep(cycle_secs)
+
+    except KeyboardInterrupt:
+        log("Ctrl-C received.")
+        await close_all_positions(ctx, cfg["watchlist"], "Ctrl-C")
+    except Exception as e:
+        log(f"Fatal error: {e}", "error")
+        raise
     finally:
-        ib.disconnect()
+        if tg:
+            await tg.stop()
+        ctx.ib.disconnect()
+        log("Disconnected from IBKR.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

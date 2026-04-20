@@ -1,0 +1,69 @@
+{
+  "_comment": "Edit this file freely. Changes take effect on the next 5-minute cycle — no restart needed.",
+
+  "watchlist": ["NVDA", "GOOGL", "AAPL", "MSFT", "AMD", "TSM", "CRM", "ADBE"],
+
+  "allocation_caps": {
+    "_comment": "When portfolio_cap_usd is set, caps are ignored — full budget can go into one stock.",
+    "NVDA":  100,
+    "GOOGL": 100,
+    "AAPL":  100,
+    "MSFT":  100,
+    "AMD":   100,
+    "TSM":   100,
+    "CRM":   100,
+    "ADBE":  100
+  },
+
+  "risk": {
+    "portfolio_cap_usd":          8000,
+    "daily_loss_limit_pct":       0.03,
+    "cash_buffer_pct":            0.02,
+    "max_single_position_pct":    0.30,
+    "max_deploy_pct":             0.70,
+    "cooldown_cycles_after_stopout": 3
+  },
+
+  "eod": {
+    "_comment": "End-of-day and end-of-week close settings.",
+    "close_all_eod":            true,
+    "close_all_friday":         true,
+    "close_minutes_before":     15
+  },
+
+  "atr": {
+    "period":          14,
+    "sl_multiplier":   1.5,
+    "tp_multiplier":   2.5,
+    "trail_multiplier": 1.0,
+    "sl_update_min_pct": 0.005
+  },
+
+  "timing": {
+    "cycle_seconds":      300,
+    "skip_first_minutes": 30
+  },
+
+  "grok": {
+    "model": "grok-4",
+    "min_conviction_score": 7,
+    "news_lookback_hours":  1,
+    "focus_topics": [
+      "unusual spike in X post volume around a cashtag in last 30 min",
+      "verified analyst or executive accounts posting bullish signals",
+      "short squeeze or unusual options flow chatter on X or Stocktwits",
+      "earnings surprise or guidance update",
+      "major product launch, partnership, or contract announcement",
+      "AI-related demand signal for chip or cloud stocks",
+      "breaking news on CNBC or Reuters in last 1 hour",
+      "semiconductor tariff or export news",
+      "insider buying or large block trade rumors"
+    ],
+    "ignore_topics": [
+      "general market commentary with no specific catalyst",
+      "posts older than 2 hours with no fresh corroboration",
+      "price predictions with no fundamental basis",
+      "news already reflected in current price movement"
+    ]
+  }
+}

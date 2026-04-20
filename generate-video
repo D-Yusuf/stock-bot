@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+import os
+import base64
+import argparse
+import subprocess
+import tempfile
+from datetime import datetime
+from urllib.request import urlopen, Request
+
+from dotenv import load_dotenv
+from xai_sdk import Client
+
+# AI upscale models (opencv dnn_superres). EDSR is higher quality, FSRCNN is faster.
+EDSR_X2_URL = "https://raw.githubusercontent.com/Saafke/EDSR_Tensorflow/master/models/EDSR_x2.pb"
+FSRCNN_X2_URL = "https://raw.githubusercontent.com/Saafke/FSRCNN_Tensorflow/master/models/FSRCNN_x2.pb"
+UPSCALE_FACTOR = 2
+
+
+ALLOWED_ASPECT_RATIOS = {
+    "1:1",
+    "16:9",
+    "9:16",
+    "4:3",
+    "3:4",
+    "3:2",
+    "2:3",
+}
+
+
+def encode_image_to_data_url(image_path: str) -> str:
+    ext = os.path.splitext(image_path)[1].lower()
+    if ext in [".jpg", ".jpeg"]:
+        mime = "image/jpeg"
+    elif ext == ".png":
+        mime = "image/png"
+    elif ext == ".webp":
+        mime = "image/webp"
+    else:
+        mime = "image/jpeg"
+
+    with open(image_path, "rb") as f:
+        image_data = base64.b64encode(f.read()).decode("utf-8")
+
+    return f"data:{mime};base64,{image_data}"
+
+
+def download_video(url: str, output_path: str) -> None:
+    with urlopen(url) as resp, open(output_path, "wb") as out_file:
+        while True:
+            chunk = resp.read(8192)
+            if not chunk:
+                break
+            out_file.write(chunk)
+
+
+def _download_model(url: str, model_path: str, name: str) -> None:
+    if os.path.exists(model_path):
+        return
+    print(f"Downloading {name} AI upscale model (one-time, may take a few minutes)...")
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urlopen(req, timeout=300) as resp, open(model_path, "wb") as f:
+            total = resp.headers.get("Content-Length")
+            total = int(total) if total else None
+            downloaded = 0
+            chunk_size = 65536
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total and downloaded % (2 * 1024 * 1024) < chunk_size:  # every ~2 MB
+                    pct = 100 * downloaded / total
+                    print(f"  ... {downloaded // (1024*1024)} MB / {total // (1024*1024)} MB ({pct:.0f}%)")
+            if total:
+                print(f"  ... 100% done.")
+    except Exception as e:
+        if os.path.exists(model_path):
+            try:
+                os.remove(model_path)
+            except OSError:
+                pass
+        hint = " Try --upscale-model fsrcnn for a much smaller, faster download." if name == "EDSR" else ""
+        raise RuntimeError(f"Failed to download {name} model: {e}.{hint}") from e
+
+
+def _reencode_with_ffmpeg(input_path: str, output_path: str) -> bool:
+    """Re-encode to H.264 so the video looks good (OpenCV mp4v often looks bad)."""
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", input_path,
+                "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                output_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def upscale_video_ai(
+    input_path: str, output_path: str, project_root: str, model_name: str = "edsr"
+) -> None:
+    """Upscale video 2x using OpenCV dnn_superres (EDSR or FSRCNN). Requires opencv-contrib-python."""
+    try:
+        import cv2
+        if not hasattr(cv2, "dnn_superres"):
+            raise ImportError("cv2.dnn_superres not found (install opencv-contrib-python)")
+    except ImportError as e:
+        raise RuntimeError(
+            "AI upscale requires opencv-contrib-python. Install with: pip install opencv-contrib-python"
+        ) from e
+
+    models_dir = os.path.join(project_root, "models")
+    os.makedirs(models_dir, exist_ok=True)
+
+    if model_name == "edsr":
+        model_path = os.path.join(models_dir, "EDSR_x2.pb")
+        _download_model(EDSR_X2_URL, model_path, "EDSR")
+        algo = "edsr"
+    else:
+        model_path = os.path.join(models_dir, "FSRCNN_x2.pb")
+        _download_model(FSRCNN_X2_URL, model_path, "FSRCNN")
+        algo = "fsrcnn"
+
+    sr = cv2.dnn_superres.DnnSuperResImpl_create()
+    sr.readModel(model_path)
+    sr.setModel(algo, UPSCALE_FACTOR)
+
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {input_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_width = width * UPSCALE_FACTOR
+    out_height = height * UPSCALE_FACTOR
+
+    # Write to temp file; we'll re-encode with ffmpeg for proper H.264 quality
+    fd, raw_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(raw_path, fourcc, fps, (out_width, out_height))
+
+        frame_count = 0
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                upscaled = sr.upsample(frame)
+                out.write(upscaled)
+                frame_count += 1
+                if frame_count % 24 == 0:
+                    print(f"  Upscaled {frame_count} frames...")
+        finally:
+            cap.release()
+            out.release()
+
+        print(f"  AI upscale complete: {frame_count} frames, output {out_width}x{out_height}")
+
+        if _reencode_with_ffmpeg(raw_path, output_path):
+            print("  Re-encoded with H.264 for better quality.")
+        else:
+            # No ffmpeg: copy raw to output and warn
+            import shutil
+            shutil.copy2(raw_path, output_path)
+            print("  Install ffmpeg and re-run for best quality (H.264 re-encode).")
+    finally:
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+
+
+def build_default_prompt() -> str:
+    return (
+        "Using the provided still image of Han leaning on the car, which has been swapped "
+        "from the original Fast & Furious vehicle to a different car, recreate a short, "
+        "cinematic Fast & Furious–style movie shot. Keep the camera position and framing "
+        "essentially locked, only allowing very subtle natural camera drift so it still "
+        "feels like a real movie shot. Do not zoom in on Han; if there is any zoom, it "
+        "should be a very gentle zoom out that reveals a bit more of the environment. "
+        "Keep Han in the same place for the entire scene, "
+        "with his hands in his pockets, but animate his head slowly turning from left to "
+        "right and back once as he looks around. The car must stay completely still—do not "
+        "move or animate the car at all. Add a stronger but still realistic wind so his "
+        "hair and loose clothing move and whip more clearly in the breeze. Add more people "
+        "walking through the scene from outside the camera frame into view and then out "
+        "again, both in the background and nearer the camera, while Han stays leaning on "
+        "the car. Use the exact car shown in the image (the new car), not the original "
+        "movie car. Frame the shot in a very wide, cinematic Cinemascope 2.35:1 style, "
+        "with strong horizontal composition. Render at maximum sharpness and quality with "
+        "no pixelation, blockiness, or missing pixels; keep details crisp and clean. Aim "
+        "for a cool, stylish, Fast & Furious vibe."
+    )
+
+
+def main() -> None:
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate a Grok Imagine Video clip from an image in ./images "
+            "and save the result into ./videos."
+        )
+    )
+    parser.add_argument(
+        "--image",
+        default="images/WhatsApp Image 2026-02-25 at 16.07.33.jpeg",
+        help="Path to the source image (relative to project root or absolute).",
+    )
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Custom prompt for the video. If omitted, uses the Fast & Furious Han scene prompt.",
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=8,
+        help="Desired video duration in seconds (1–15).",
+    )
+    parser.add_argument(
+        "--aspect-ratio",
+        dest="aspect_ratio",
+        default="16:9",
+        help=(
+            "Aspect ratio for the video (e.g. 16:9, 9:16, 1:1, 4:3, 3:4, 3:2, 2:3). "
+            "Default is 16:9. The API does not support 2.35:1 directly, so use 16:9 and crop "
+            "in post if you need exact Cinemascope."
+        ),
+    )
+    parser.add_argument(
+        "--resolution",
+        default="720p",
+        help="Video resolution. Grok supports 480p or 720p only (720p is highest quality).",
+    )
+    parser.add_argument(
+        "--no-upscale",
+        dest="upscale",
+        action="store_false",
+        help="Skip AI upscale step. By default, video is upscaled 2x (e.g. 720p -> 1440p) to reduce pixelation.",
+    )
+    parser.add_argument(
+        "--upscale-model",
+        dest="upscale_model",
+        choices=("edsr", "fsrcnn"),
+        default="edsr",
+        help="AI upscale model: edsr (better quality, slower) or fsrcnn (faster). Default: edsr.",
+    )
+    args = parser.parse_args()
+
+    project_root = os.path.dirname(os.path.abspath(__file__))
+
+    image_path = args.image
+    if not os.path.isabs(image_path):
+        image_path = os.path.join(project_root, image_path)
+
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found at: {image_path}")
+
+    prompt = args.prompt or build_default_prompt()
+
+    api_key = os.getenv("XAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("XAI_API_KEY is not set in your environment or .env file.")
+
+    client = Client(api_key=api_key)
+
+    print("Encoding source image...")
+    image_data_url = encode_image_to_data_url(image_path)
+
+    print("Requesting video generation from Grok Imagine Video...")
+    generate_kwargs = dict(
+        prompt=prompt,
+        model="grok-imagine-video",
+        image_url=image_data_url,
+        duration=args.duration,
+        resolution=args.resolution,
+    )
+    if args.aspect_ratio:
+        if args.aspect_ratio not in ALLOWED_ASPECT_RATIOS:
+            raise ValueError(
+                f"Invalid aspect ratio '{args.aspect_ratio}'. "
+                f"Supported values: {', '.join(sorted(ALLOWED_ASPECT_RATIOS))}."
+            )
+        generate_kwargs["aspect_ratio"] = args.aspect_ratio
+
+    response = client.video.generate(**generate_kwargs)
+
+    videos_dir = os.path.join(project_root, "videos")
+    os.makedirs(videos_dir, exist_ok=True)
+
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_path = os.path.join(videos_dir, f"{base_name}-{timestamp}.mp4")
+
+    print(f"Downloading video from {response.url}...")
+    download_video(response.url, output_path)
+
+    if args.upscale:
+        upscaled_path = output_path.replace(".mp4", "-upscaled.mp4")
+        print(f"AI upscaling video (2x {args.upscale_model.upper()})...")
+        upscale_video_ai(output_path, upscaled_path, project_root, model_name=args.upscale_model)
+        os.remove(output_path)
+        os.rename(upscaled_path, output_path)
+
+    print(f"Video saved to: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
+
