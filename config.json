@@ -1,7 +1,9 @@
 {
   "_comment": "Edit this file freely. Changes take effect on the next 5-minute cycle — no restart needed.",
+  "mode": "live",
 
-  "watchlist": ["NVDA", "GOOGL", "AAPL", "MSFT", "AMD", "TSM", "CRM", "ADBE"],
+  "watchlist": ["NVDA", "GOOGL", "AAPL", "AMD", "AMZN", "META"],
+  "_watchlist_disabled": ["MSFT", "ADBE", "TSM"],
 
   "allocation_caps": {
     "_comment": "When portfolio_cap_usd is set, caps are ignored — full budget can go into one stock.",
@@ -10,17 +12,15 @@
     "AAPL":  100,
     "MSFT":  100,
     "AMD":   100,
-    "TSM":   100,
-    "CRM":   100,
-    "ADBE":  100
+    "AMZN":  100
   },
 
   "risk": {
-    "portfolio_cap_usd":          8000,
     "daily_loss_limit_pct":       0.03,
-    "cash_buffer_pct":            0.02,
+    "portfolio_cap_usd":          9300,
+    "cash_buffer_pct":            0.054,
     "max_single_position_pct":    0.30,
-    "max_deploy_pct":             0.70,
+    "max_deploy_pct":             1.0,
     "cooldown_cycles_after_stopout": 3
   },
 
@@ -28,7 +28,7 @@
     "_comment": "End-of-day and end-of-week close settings.",
     "close_all_eod":            true,
     "close_all_friday":         true,
-    "close_minutes_before":     15
+    "close_minutes_before":     10
   },
 
   "atr": {
@@ -40,8 +40,12 @@
   },
 
   "timing": {
-    "cycle_seconds":      300,
+    "cycle_seconds":      900,
     "skip_first_minutes": 30
+  },
+
+  "claude": {
+    "model": "claude-sonnet-4-6"
   },
 
   "grok": {

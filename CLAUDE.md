@@ -42,6 +42,20 @@ Stocks to avoid (fail Shariah screen):
 - `check.py` — standalone IBKR connection test
 - `.env` — API keys and account config (never commit)
 
+## Daily Progress Tracking
+- **ALWAYS** write end-of-session summary to `/progress/YYYY-MM-DD.md` without being asked
+- **ALWAYS** update `progress/trades.csv` for any closed trades without being asked
+- Keep progress files SHORT — no essays. Format:
+
+```
+# 2026-04-22
+Net P&L: +$12.50 unrealized | $0 realized
+Held overnight: GOOGL, MSFT, AMD, NVDA
+Closed: ADBE -$17.81, CRM -$3.43
+Bugs fixed: trim bug, JSON truncation
+Features: hold_overnight, QQQ check, hybrid Grok+Claude
+```
+
 ## Bug Tracking
 - Any bug found (even minor) must be documented in `BUGS_AND_IMPROVEMENTS.md`
 - Include: date, what happened, root cause, fix applied

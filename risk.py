@@ -58,7 +58,8 @@ class RiskGuard:
         self.cash_deployed -= old.get('qty', 0) * old.get('fill_price', 0)
         self.session_trades[ticker] = {
             'qty': qty, 'fill_price': fill_price, 'sl': sl, 'tp': tp,
-            'time': datetime.datetime.now().strftime('%H:%M:%S')
+            'time': datetime.datetime.now().strftime('%H:%M:%S'),
+            'entry_dt': datetime.datetime.now().isoformat(),
         }
         self.cash_deployed += qty * fill_price
         _save_session_trades(self.session_trades)

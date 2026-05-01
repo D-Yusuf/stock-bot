@@ -1,7 +1,8 @@
 import asyncio
+import datetime
 from ib_async import Stock, MarketOrder, StopOrder, LimitOrder
 from config import AppContext
-from logger import log, log_order, emit_event
+from logger import log, log_order, emit_event, log_trade_csv
 from account import get_total_capital, get_available_cash
 from atr import get_atr
 from helpers import is_market_open, within_30min_of_open
@@ -12,28 +13,55 @@ from risk import RiskGuard
 MIN_DELTA = 1
 
 
-async def close_all_positions(ctx: AppContext, watchlist: list, reason: str = "shutdown"):
+async def close_all_positions(ctx: AppContext, watchlist: list, reason: str = "shutdown", risk: RiskGuard = None):
     log(f"CLOSING ALL POSITIONS — reason: {reason}")
     positions = {p.contract.symbol: p.position
                  for p in await ctx.ib.reqPositionsAsync()}
 
     for t in await ctx.ib.reqAllOpenOrdersAsync():
-        if t.contract.symbol in watchlist:
-            ctx.ib.cancelOrder(t.order)
+        sym = t.contract.symbol
+        if sym not in watchlist:
+            continue
+        session = risk.session_trades.get(sym) if risk else None
+        if session and session.get('hold_overnight') and reason in ("end of day", "Friday close"):
+            continue
+        ctx.ib.cancelOrder(t.order)
     await asyncio.sleep(1)
 
     for ticker, qty in positions.items():
         if ticker not in watchlist or qty <= 0:
             continue
+        session = risk.session_trades.get(ticker) if risk else None
+        if session and session.get('hold_overnight') and reason in ("end of day", "Friday close"):
+            log(f"  {ticker}: hold_overnight=True — keeping position open.")
+            continue
         contract = Stock(ticker, 'SMART', 'USD')
         await ctx.ib.qualifyContractsAsync(contract)
         log(f"  Closing {qty} x {ticker}")
-        log_order("SELL (close)", ticker, int(qty), 0.0, reason=[f"Position closed — {reason}"])
-        emit_event("SELL", {"ticker": ticker, "qty": int(qty), "reason": reason})
-        order          = MarketOrder('SELL', qty, account=ctx.ib_acc)
+
+        session  = risk.session_trades.get(ticker) if risk else None
+        entry_dt = datetime.datetime.fromisoformat(
+            session.get('entry_dt', datetime.datetime.now().isoformat())
+        ) if session else datetime.datetime.now()
+
+        sell_qty = int(qty)  # floor to whole shares — API rejects fractional market sells
+        log_order("SELL (close)", ticker, sell_qty, 0.0, reason=[f"Position closed — {reason}"])
+        emit_event("SELL", {"ticker": ticker, "qty": sell_qty, "reason": reason})
+        order          = MarketOrder('SELL', sell_qty, account=ctx.ib_acc)
         order.tif      = 'DAY'
         order.transmit = True
-        ctx.ib.placeOrder(contract, order)
+        trade = ctx.ib.placeOrder(contract, order)
+
+        # Wait for fill to get real exit price and commission
+        deadline = asyncio.get_event_loop().time() + 30
+        while not trade.isDone() and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.5)
+
+        if trade.isDone() and trade.orderStatus.status == 'Filled' and session:
+            real_exit      = trade.orderStatus.avgFillPrice or session['fill_price']
+            buy_commission = session.get('commission', 1.0)
+            log_trade_csv(ticker, session['fill_price'], real_exit, int(qty), reason, entry_dt,
+                          commission=buy_commission)
 
     log("All positions submitted for closure.")
 
@@ -41,9 +69,21 @@ async def close_all_positions(ctx: AppContext, watchlist: list, reason: str = "s
 async def check_for_stopouts(ctx: AppContext, risk: RiskGuard, prev_positions: dict, watchlist: list) -> dict:
     current_positions = {p.contract.symbol: p.position
                          for p in await ctx.ib.reqPositionsAsync()}
+
     for ticker in watchlist:
         if prev_positions.get(ticker, 0) > 0 and current_positions.get(ticker, 0) == 0:
             log(f"  {ticker}: position gone — likely stopped out. Entering cooldown.")
+            session = risk.session_trades.get(ticker)
+            if session:
+                entry_dt       = datetime.datetime.fromisoformat(session.get('entry_dt', datetime.datetime.now().isoformat()))
+                # Use real fill price captured by execDetailsEvent hook in main.py
+                # Falls back to SL price only if hook hasn't fired yet
+                exit_price     = session.get('last_exit_price', session['sl'])
+                buy_commission = session.get('commission', 1.0)
+                log_trade_csv(ticker, session['fill_price'], exit_price,
+                              session['qty'], "SL hit", entry_dt,
+                              commission=buy_commission)
+                risk.close_session_trade(ticker)
             risk.enter_cooldown(ticker)
             emit_event("STOPOUT", {"ticker": ticker})
     return current_positions
@@ -149,6 +189,7 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
         in_session     = ticker in risk.session_trades
         is_preexisting = current_qty > 0 and not in_session
 
+
         # ---- Pre-existing position protection ----
         if is_preexisting:
             log(f"{ticker} | held={current_qty}sh | pre-existing — managing full position protection.")
@@ -214,6 +255,12 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
         else:
             target_value = (pct / 100) * investable
             target_qty   = int(target_value / price)
+            # Never trim below what we originally bought this session.
+            # The free budget shrinks as we buy more tickers, which would make
+            # earlier positions look "over target" and trigger spurious trims.
+            # SL/TP protect the downside — let them do their job.
+            if in_session:
+                target_qty = max(target_qty, session_qty)
         delta_qty = target_qty - session_qty
 
         has_sl = 'STP' in open_protection.get(ticker, {})
@@ -225,6 +272,11 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
 
         # ---- CASE 1: At or above target ----
         if delta_qty == 0 or (delta_qty < 0 and session_qty > 0):
+            # Hard guard: never sell what we don't hold in IBKR
+            if current_qty <= 0 and delta_qty < 0:
+                log(f"  {ticker}: SELL blocked — IBKR shows 0 shares held (stale session_trades?).")
+                risk.close_session_trade(ticker)
+                continue
             if session_qty <= 0 and not is_preexisting:
                 continue
             if session_qty <= 0:
@@ -240,8 +292,13 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
                     if not ok:
                         log(f"  Stopping: {reason}", "warning")
                         break
-                    trim_qty = min(abs(delta_qty), session_qty)
-                    remaining_qty = session_qty - trim_qty
+                    # Use current_qty (IBKR real) not session_qty (bot memory)
+                    # Prevents selling more than we actually hold → short sell rejection
+                    if current_qty <= 0:
+                        log(f"  {ticker}: trim skipped — IBKR shows 0 shares held.")
+                        continue
+                    trim_qty = min(abs(delta_qty), current_qty)
+                    remaining_qty = current_qty - trim_qty
                     log(f"  TRIM {trim_qty} x {ticker} (significantly over target, {remaining_qty}sh remaining)")
 
                     if ticker in open_protection:
@@ -329,14 +386,19 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
                 log(f"  {ticker} BUY not filled in 30s — leaving unprotected for now.", "warning")
                 continue
 
-            fill_price  = trade.orderStatus.avgFillPrice or price
-            new_session = session_qty + delta_qty
-            sl_price    = round(fill_price - sl_distance, 2)
-            tp_price    = round(fill_price + tp_distance, 2)
-            rr          = cfg["atr"]["tp_multiplier"] / cfg["atr"]["sl_multiplier"]
+            fill_price     = trade.orderStatus.avgFillPrice or price
+            new_session    = session_qty + delta_qty
+            sl_price       = round(fill_price - sl_distance, 2)
+            tp_price       = round(fill_price + tp_distance, 2)
+            rr             = cfg["atr"]["tp_multiplier"] / cfg["atr"]["sl_multiplier"]
+            # Grab commission from fill report (IBKR sends it with the fill)
+            buy_commission = sum(f.commissionReport.commission for f in trade.fills
+                                 if f.commissionReport.commission > 0) or 1.0
 
-            log(f"  FILLED @ ${fill_price:.2f} | SL=${sl_price} TP=${tp_price} R:R=1:{rr:.1f} | session={new_session}sh")
+            log(f"  FILLED @ ${fill_price:.2f} | SL=${sl_price} TP=${tp_price} R:R=1:{rr:.1f} | commission=${buy_commission:.2f} | session={new_session}sh")
             risk.record_session_trade(ticker, new_session, fill_price, sl_price, tp_price)
+            risk.session_trades[ticker]['commission'] = buy_commission
+            # entry_dt stored in session_trades for CSV logging on close
             ticker_reason = [r for r in (reasoning or []) if ticker in r]
             log_order("BUY", ticker, delta_qty, fill_price, sl_price, tp_price, ticker_reason)
             emit_event("BUY", {"ticker": ticker, "qty": delta_qty, "price": fill_price,

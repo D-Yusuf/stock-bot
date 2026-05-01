@@ -21,9 +21,10 @@ def is_market_open() -> bool:
 
 
 def within_30min_of_open() -> bool:
+    # Skip first 10 min only — reduced from 30 to catch gap moves on news
     now    = datetime.datetime.now(ET_TZ)
     open_t = now.replace(hour=9,  minute=30, second=0, microsecond=0)
-    cutoff = now.replace(hour=10, minute=0,  second=0, microsecond=0)
+    cutoff = now.replace(hour=9,  minute=40, second=0, microsecond=0)
     return open_t <= now < cutoff
 
 
