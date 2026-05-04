@@ -1,0 +1,30 @@
+# Secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Logs (keep bot_activity.log tracked if desired, but exclude rotated/overflow logs)
+bot_activity.log
+bot_activity.log.*
+bot_stdout.log
+bot_stderr.log
+orders.log
+
+# Runtime state (changes every session)
+session_trades.json
+bot_instructions.txt
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

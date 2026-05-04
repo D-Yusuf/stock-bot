@@ -1,5 +1,8 @@
 import asyncio
 import datetime
+import socket
+import subprocess
+import time
 from config import IB_HOST, IB_PORT, load_config, create_context, TRADING_MODE
 from logger import log
 from helpers import (
@@ -10,6 +13,53 @@ from account import get_total_capital
 from risk import RiskGuard
 from strategy import get_grok_strategy, get_hold_overnight_flags
 from trading import trade_rebalance, close_all_positions, check_for_stopouts
+
+
+TWS_APP = "/Users/mac/Applications/Trader Workstation/Trader Workstation.app"
+_TWS_LAUNCH_TIMEOUT = 120  # seconds to wait for TWS to open its API port
+
+
+def _tws_port_open() -> bool:
+    try:
+        s = socket.create_connection((IB_HOST, IB_PORT), timeout=2)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _tws_process_running() -> bool:
+    try:
+        out = subprocess.check_output(["pgrep", "-f", "Trader Workstation"], text=True)
+        return bool(out.strip())
+    except subprocess.CalledProcessError:
+        return False
+
+
+def _ensure_tws_running():
+    if _tws_port_open():
+        log("TWS API port is open — already running.")
+        return
+
+    if not _tws_process_running():
+        log("TWS not running — launching Trader Workstation...")
+        subprocess.Popen(["open", "-a", TWS_APP])
+    else:
+        log("TWS process found but API port not yet open — waiting for API to start...")
+
+    log(f"Waiting up to {_TWS_LAUNCH_TIMEOUT}s for TWS API port {IB_PORT}...")
+    deadline = time.time() + _TWS_LAUNCH_TIMEOUT
+    while time.time() < deadline:
+        if _tws_port_open():
+            log("TWS API port is now open.")
+            return
+        time.sleep(3)
+
+    raise RuntimeError(
+        f"TWS did not open API port {IB_PORT} within {_TWS_LAUNCH_TIMEOUT}s. "
+        "Check that 'Enable ActiveX and Socket Clients' is enabled in TWS API settings "
+        "and Socket port matches IB_PORT in .env."
+    )
 
 
 def _print_banner():
@@ -202,6 +252,7 @@ async def main():
     start_keyboard_listener()
 
     log(f"Mode: {'📄 PAPER TRADING' if TRADING_MODE == 'paper' else '💰 LIVE TRADING'}")
+    _ensure_tws_running()
     log(f"Connecting to IBKR at {IB_HOST}:{IB_PORT}...")
     await ctx.ib.connectAsync(IB_HOST, IB_PORT, clientId=15, timeout=60)
     log("Connected.")
