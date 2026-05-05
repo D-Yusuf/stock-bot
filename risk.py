@@ -26,6 +26,8 @@ def _save_session_trades(trades: dict):
         json.dump({"date": str(datetime.date.today()), "trades": trades}, f)
 
 
+# TO CHANGE risk limits: edit config.json → risk (daily_loss_limit_pct, cash_buffer_pct, cooldown_cycles_after_stopout)
+# All values are loaded from config.json — no code changes needed for tuning
 class RiskGuard:
     def __init__(self, starting_equity: float, daily_loss_pct: float, cooldown_cycles: int):
         self.starting_equity = starting_equity

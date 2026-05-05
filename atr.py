@@ -10,6 +10,8 @@ async def get_atr(ctx: AppContext, contract: Stock, cfg: dict) -> float | None:
             contract,
             endDateTime='',
             durationStr=f'{period + 5} D',
+            # TO USE INTRADAY ATR: change barSizeSetting to '15 mins' and durationStr to '2 D'
+            # Intraday ATR gives tighter SL/TP — better suited for same-day trades
             barSizeSetting='1 day',
             whatToShow='TRADES',
             useRTH=True,

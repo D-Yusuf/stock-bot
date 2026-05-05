@@ -329,3 +329,112 @@ Return ONLY valid JSON, no markdown, no extra keys, no trailing text. Use ONLY w
     except Exception as e:
         log(f"Grok analysis error: {e}", "error")
         return None
+
+
+async def get_sl_adjustments(
+    ctx: AppContext,
+    held_positions: dict,
+    cfg: dict,
+) -> dict:
+    """
+    Every cycle, for each held position: scan fresh news and ask Claude
+    whether to tighten the SL based on sentiment shift.
+
+    held_positions: {ticker: {"qty": int, "entry": float, "current_price": float, "sl": float, "tp": float}}
+
+    Returns {ticker: new_sl_price} only for tickers where SL should change.
+    Tickers not in the result = leave SL unchanged.
+    TP is never touched here — we let winners run.
+    """
+    if not held_positions:
+        return {}
+
+    gcfg = cfg.get("grok", {})
+
+    search_targets = "\n".join(
+        f"  {t}: X cashtag {TICKERS_CONTEXT[t][0]}, keywords: {TICKERS_CONTEXT[t][1]}"
+        for t in held_positions if t in TICKERS_CONTEXT
+    )
+
+    search_prompt = f"""Scan X and web RIGHT NOW for news on these held stock positions. Date: {datetime.datetime.now():%b %d %Y %H:%M ET}
+
+{search_targets}
+
+For each ticker report ONE line:
+TICKER | BULLISH/BEARISH/NEUTRAL | HIGH/MEDIUM/LOW | key signal in last 30 min (1 sentence)
+
+Focus on: any negative catalysts, earnings warnings, analyst downgrades, macro headwinds, sector rotation, unusual selling pressure."""
+
+    raw_news = ""
+    try:
+        search_response = ctx.client.responses.create(
+            model=gcfg.get("model", "grok-4"),
+            input=[{"role": "user", "content": sanitize(search_prompt)}],
+            tools=[
+                {"type": "x_search"},
+                {"type": "web_search", "allowed_domains": [
+                    "reuters.com", "bloomberg.com", "cnbc.com", "sec.gov", "stocktwits.com"
+                ]},
+            ],
+        )
+        raw_news = search_response.output_text
+        log("SL NEWS SCAN:")
+        for line in raw_news.strip().splitlines():
+            log(f"  {line}")
+    except Exception as e:
+        log(f"SL scan error: {e} — skipping SL adjustment this cycle.", "warning")
+        return {}
+
+    positions_lines = "\n".join(
+        f"  {t}: {info['qty']}sh | entry=${info['entry']:.2f} | now=${info['current_price']:.2f} | "
+        f"SL=${info['sl']:.2f} | TP=${info['tp']:.2f} | P&L=${info['current_price']*info['qty'] - info['entry']*info['qty']:+.2f}"
+        for t, info in held_positions.items()
+    )
+
+    prompt = f"""You are managing stop-losses for active stock positions. Date: {datetime.datetime.now():%b %d %Y %H:%M ET}
+
+HELD POSITIONS:
+{positions_lines}
+
+LIVE NEWS:
+{raw_news}
+
+Rules:
+- Only tighten SL if there is a STRONG and SPECIFIC bearish catalyst: analyst downgrade with price target cut, earnings warning, SEC filing, major negative news on CNBC/Reuters/Bloomberg, or confirmed institutional selling.
+- Do NOT tighten SL for: vague bearish sentiment, technical analysis opinions, minor dips, "may give up gains" type commentary, or anything speculative.
+- If you do tighten: new SL must be at least 2% below current price — never closer (gives room to breathe)
+- If news is BULLISH, NEUTRAL, or only mildly bearish → return null (no change)
+- Never widen SL (only tighten or keep same)
+- TP is never changed — leave it alone
+- When in doubt → return null. It is better to leave the SL unchanged than to tighten prematurely.
+
+Return ONLY valid JSON with new SL prices for tickers that need adjustment. Use null for no change:
+{{"AMD": 338.50, "GOOGL": null}}
+"""
+
+    try:
+        model    = cfg.get("claude", {}).get("model", "claude-sonnet-4-6")
+        response = ctx.claude.messages.create(
+            model=model,
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        content = response.content[0].text
+        clean   = re.sub(r'```(?:json)?|```', '', content).strip()
+        match   = re.search(r'\{.*\}', clean, re.DOTALL)
+        if not match:
+            log("SL adjustment: no JSON returned — keeping existing stops.", "warning")
+            return {}
+        raw = json.loads(match.group())
+        result = {t: v for t, v in raw.items() if v is not None and isinstance(v, (int, float))}
+        if result:
+            log("SL ADJUSTMENTS:")
+            for ticker, new_sl in result.items():
+                old_sl = held_positions.get(ticker, {}).get("sl", 0)
+                log(f"  {ticker}: SL ${old_sl:.2f} → ${new_sl:.2f}")
+        else:
+            log("  SL scan: no adjustments needed this cycle.")
+        return result
+    except Exception as e:
+        log(f"SL adjustment error: {e}", "error")
+        return {}

@@ -7,6 +7,7 @@ from account import get_total_capital, get_available_cash
 from atr import get_atr
 from helpers import is_market_open, within_30min_of_open
 from risk import RiskGuard
+from strategy import get_sl_adjustments
 
 # Minimum shares to bother buying. Prevents placing a 1-share order worth $5.
 # Raise this if you want to avoid very small top-up buys.
@@ -125,10 +126,14 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
     available_cash = await get_available_cash(ctx)
     cash_buffer    = cfg["risk"]["cash_buffer_pct"]
     cap_usd        = cfg["risk"].get("portfolio_cap_usd")
-    investable     = available_cash * (1.0 - cash_buffer)
+    spendable      = available_cash * (1.0 - cash_buffer)
     if cap_usd:
-        investable = min(investable, cap_usd)
-    investable = max(0.0, investable - risk.cash_deployed)
+        already_in_market = total_capital - available_cash
+        room_under_cap    = max(0.0, cap_usd - already_in_market)
+        investable        = min(spendable, room_under_cap)
+    else:
+        investable = spendable
+    investable = max(0.0, investable)
     log(f"Equity: ${total_capital:,.2f} | Cash: ${available_cash:,.2f} | "
         f"Deployed: ${risk.cash_deployed:.2f} | Free budget: ${investable:,.2f}")
     risk.log_session_summary()
@@ -155,6 +160,34 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
 
     held_tickers = {sym for sym, qty in positions.items() if qty > 0 and sym in cfg["watchlist"]}
     all_tickers  = {t: strategy.get(t, 0) for t in (set(strategy.keys()) | held_tickers)}
+
+    # News-driven SL adjustment — scan fresh news for all held positions every cycle.
+    # Tightens SL if sentiment has turned bearish. TP is never touched.
+    # TO DISABLE: remove this block and set sl_adjustments = {}
+    # TO CHANGE sensitivity: edit the Rules section in get_sl_adjustments() prompt in strategy.py
+    # TO CHANGE minimum SL distance: edit the 0.98 multiplier below (default 2% away from price)
+    sl_adjustments: dict[str, float] = {}
+    if held_tickers:
+        held_info = {}
+        for sym in held_tickers:
+            session = risk.session_trades.get(sym)
+            if not session:
+                continue
+            contract = Stock(sym, 'SMART', 'USD')
+            await ctx.ib.qualifyContractsAsync(contract)
+            ctx.ib.reqMarketDataType(1)
+            [td] = await ctx.ib.reqTickersAsync(contract)
+            price = td.marketPrice() or td.last or td.close
+            if price and price > 0:
+                held_info[sym] = {
+                    "qty":           session["qty"],
+                    "entry":         session["fill_price"],
+                    "current_price": price,
+                    "sl":            session["sl"],
+                    "tp":            session.get("tp", 0),
+                }
+        if held_info:
+            sl_adjustments = await get_sl_adjustments(ctx, held_info, cfg)
 
     for ticker, pct in all_tickers.items():
         if ticker not in cfg["watchlist"]:
@@ -284,6 +317,7 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
 
             if delta_qty < 0:
                 over_pct = abs(delta_qty) / target_qty if target_qty > 0 else 1
+                # TO CHANGE trim sensitivity: adjust the 0.10 threshold (10% over target triggers trim)
                 if over_pct < 0.10:
                     log(f"  {ticker}: {abs(delta_qty)}sh over target but within 10% — not trimming.")
                     delta_qty = 0
@@ -348,6 +382,26 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
                     ctx.ib.placeOrder(contract, new_sl)
                 else:
                     log(f"  {ticker}: stop ${current_sl:.2f} still valid — no update.")
+
+            # News-driven SL tighten — overrides ATR trailing if bearish signal found
+            if ticker in sl_adjustments and has_sl:
+                news_sl      = round(sl_adjustments[ticker], 2)
+                existing_stp = open_protection.get(ticker, {}).get('STP')
+                current_sl   = existing_stp.order.auxPrice if existing_stp else 0
+                min_distance = round(price * 0.98, 2)  # hard floor: SL must be ≥2% below price
+                news_sl      = min(news_sl, min_distance)  # never closer than 1.5%
+                # Only apply if tighter than current SL and safely below current price
+                if news_sl > current_sl and news_sl < price:
+                    log(f"  {ticker}: NEWS tightening SL ${current_sl:.2f} → ${news_sl:.2f} (min distance enforced)")
+                    if existing_stp:
+                        ctx.ib.cancelOrder(existing_stp.order)
+                        await asyncio.sleep(0.3)
+                    new_sl          = StopOrder('SELL', protected_qty, news_sl, account=ctx.ib_acc, tif='GTC')
+                    new_sl.transmit = True
+                    ctx.ib.placeOrder(contract, new_sl)
+                    risk.session_trades[ticker]['sl'] = news_sl
+                elif news_sl <= current_sl:
+                    log(f"  {ticker}: news SL ${news_sl:.2f} not tighter than current ${current_sl:.2f} — keeping.")
 
             elif delta_qty == 0 and not has_sl:
                 log(f"  {ticker}: position unprotected — attaching SL+TP now.")

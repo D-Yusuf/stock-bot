@@ -9,16 +9,26 @@ __pycache__/
 *.pyd
 .Python
 
-# Logs (keep bot_activity.log tracked if desired, but exclude rotated/overflow logs)
+# Logs
 bot_activity.log
 bot_activity.log.*
 bot_stdout.log
 bot_stderr.log
 orders.log
 
-# Runtime state (changes every session)
+# Runtime state
 session_trades.json
 bot_instructions.txt
+
+# Daily progress / personal journal
+progress/
+
+# Claude Code / internal docs
+CLAUDE.md
+APP_OVERVIEW.md
+BUGS_AND_IMPROVEMENTS.md
+STRATEGY.md
+STRUCTURE.md
 
 # macOS
 .DS_Store

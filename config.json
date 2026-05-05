@@ -2,8 +2,8 @@
   "_comment": "Edit this file freely. Changes take effect on the next 5-minute cycle — no restart needed.",
   "mode": "live",
 
-  "watchlist": ["NVDA", "GOOGL", "AAPL", "AMD", "AMZN", "META"],
-  "_watchlist_disabled": ["MSFT", "ADBE", "TSM"],
+  "watchlist": ["NVDA", "GOOGL", "AAPL", "AMD", "AMZN"],
+  "_watchlist_disabled": ["MSFT", "ADBE", "TSM", "META"],
 
   "allocation_caps": {
     "_comment": "When portfolio_cap_usd is set, caps are ignored — full budget can go into one stock.",

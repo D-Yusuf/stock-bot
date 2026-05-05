@@ -424,17 +424,23 @@ async def main():
 
                 available_cash = await get_available_cash(ctx)
                 cap_usd        = cfg["risk"].get("portfolio_cap_usd")
-                max_deploy     = cfg["risk"].get("max_deploy_pct", 0.70)
+                total_capital  = await get_total_capital(ctx)
 
-                # Apply 70% deploy cap and portfolio USD cap
-                investable = available_cash * (1.0 - cfg["risk"]["cash_buffer_pct"])
-                investable = investable * max_deploy
+                # Free budget = cash we actually have minus the buffer reserve.
+                # portfolio_cap_usd caps total portfolio value (deployed + free),
+                # so free = cap - already_deployed (but never more than available cash).
+                cash_buffer = cfg["risk"]["cash_buffer_pct"]
+                spendable   = available_cash * (1.0 - cash_buffer)
                 if cap_usd:
-                    investable = min(investable, cap_usd)
+                    already_in_market = total_capital - available_cash
+                    room_under_cap    = max(0.0, cap_usd - already_in_market)
+                    free_budget       = min(spendable, room_under_cap)
+                else:
+                    free_budget = spendable
 
-                free_budget = max(0.0, investable - risk.cash_deployed)
-                log(f"  Budget: ${investable:.0f} cap ({int(max_deploy*100)}% deploy) | "
-                    f"${risk.cash_deployed:.0f} deployed | ${free_budget:.0f} free")
+                free_budget = max(0.0, free_budget)
+                log(f"  Cash: ${available_cash:.0f} | buffer: {int(cash_buffer*100)}% | "
+                    f"spendable: ${spendable:.0f} | free budget: ${free_budget:.0f}")
 
                 MIN_BUY_BUDGET = 150.0
                 scan_budget = free_budget if free_budget >= MIN_BUY_BUDGET else 0.0
