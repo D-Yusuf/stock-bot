@@ -58,15 +58,11 @@ TICKER | BULLISH/BEARISH/NEUTRAL | HIGH/MEDIUM/LOW | next-week catalyst (1 sente
 Focus on: next week earnings calendar, analyst price targets, macro events (Fed, CPI, jobs), institutional buying, weekend risk events.
 Look back 6 hours. Flag any known weekend risk (geopolitical, regulatory, earnings surprise risk)."""
     else:
-        search_prompt = f"""Scan X and web RIGHT NOW for multi-day outlook on these stocks. Date: {datetime.datetime.now():%b %d %Y %H:%M ET}
+        search_prompt = f"""Research overnight risk/reward for these stock positions. Date: {datetime.datetime.now():%b %d %Y %H:%M ET}
 
 {search_targets}
 
-For each ticker report ONE line:
-TICKER | BULLISH/BEARISH/NEUTRAL | HIGH/MEDIUM/LOW | key catalyst for next 1-5 days (1 sentence) | any earnings, product launches, analyst events upcoming?
-
-Focus on: upcoming earnings, analyst upgrades/targets, product launches, macro tailwinds, institutional activity.
-Look back 4 hours max."""
+For each ticker find: any major news event happening tonight or tomorrow (earnings, product launch, Fed decision, analyst day, FDA ruling, etc.) and the current market sentiment. Report what you find — be thorough, don't summarize away important details."""
 
     raw_news = ""
     try:
@@ -96,24 +92,19 @@ Look back 4 hours max."""
 
     news_section = f"LIVE NEWS:\n{raw_news}" if raw_news else "No live news available — decide based on position data only."
 
-    if is_friday:
-        hold_criteria = """HOLD over weekend if: strong next-week catalyst confirmed (earnings beat, analyst upgrade, product launch Monday), position is profitable, momentum is intact, no major weekend risk events.
-CLOSE before weekend if: no clear next-week catalyst, position in loss, bearish signals, geopolitical/regulatory risk, or earnings surprise risk that could gap down Monday.
-Be MORE selective on Fridays — holding over a weekend means 3 days of gap risk. Only hold if the setup is genuinely strong."""
-    else:
-        hold_criteria = """HOLD if: upcoming earnings with strong outlook, major product launch, strong multi-day bullish catalyst, position is profitable with momentum.
-CLOSE if: intraday-only signal, stale news, bearish catalyst, position in loss with no upcoming catalyst, high overnight risk.
-Be willing to take calculated risks on strong multi-day setups — that's how trading makes money."""
+    weekend_note = "These positions would be held over the ENTIRE WEEKEND (Friday close → Monday open)." if is_friday else ""
 
-    prompt = f"""You are reviewing {'end-of-week' if is_friday else 'end-of-day'} positions for a Shariah-compliant trading bot. Date: {datetime.datetime.now():%b %d %Y %H:%M ET}
-{'These positions would be held over the ENTIRE WEEKEND if flagged HOLD.' if is_friday else ''}
+    prompt = f"""You are a trading analyst deciding which positions to hold overnight for a Shariah-compliant long-only portfolio. Date: {datetime.datetime.now():%b %d %Y %H:%M ET}
+{weekend_note}
 
 HELD POSITIONS:
 {positions_lines}
 
 {news_section}
 
-{hold_criteria}
+Hard rule: if a stock has earnings releasing TODAY after close or TOMORROW before open → always return true. Earnings are a known catalyst and the position must be held.
+
+For everything else, use your judgment — weigh the overnight risk vs reward and make the smartest call for each position.
 
 Return ONLY valid JSON, no markdown:
 {{"GOOGL": true, "MSFT": false}}
@@ -149,15 +140,17 @@ async def get_grok_strategy(
     conversation: list,
     cfg: dict,
     investable: float = 9000.0,
-) -> dict | None:
+    held_positions: dict = None,
+) -> tuple[dict | None, str]:
     """
     Two-pass Grok strategy:
-      Pass A — live X + web search → raw sentiment per ticker
+      Pass A — live X + web search → raw sentiment per ticker + SL news in one call
       Pass B — pure reasoning → conviction scores + USD allocations
 
-    Returns dict of {ticker: pct_of_budget} for qualifying tickers,
-    plus "_reasoning" key with Grok's explanation list.
-    Returns None if no qualifying signals.
+    held_positions: optional dict of held position info for combined SL scan.
+    Returns (strategy_dict | None, raw_news_str).
+    strategy_dict has {ticker: pct_of_budget} plus "_reasoning" key.
+    raw_news is passed back so get_sl_adjustments() can reuse it without a second Grok call.
     """
 
     log(f"[{datetime.datetime.now():%H:%M:%S}] Scanning news for {', '.join(watchlist)}...")
@@ -192,6 +185,20 @@ async def get_grok_strategy(
         for t in watchlist if t in TICKERS_CONTEXT
     )
 
+    # If we hold positions, include them in the same scan to save a Grok call.
+    # The single response covers both buy signals and SL-relevant bearish news.
+    held_section = ""
+    if held_positions:
+        held_lines = "\n".join(
+            f"  {t}: entry=${info['entry']:.2f} | now=${info['current_price']:.2f} | SL=${info['sl']:.2f}"
+            for t, info in held_positions.items() if t in TICKERS_CONTEXT
+        )
+        held_section = f"""
+Also flag any STRONG bearish catalysts for these HELD positions (analyst downgrade with PT cut, earnings warning, SEC filing, breaking bad news):
+{held_lines}
+Add a line for each held ticker:
+HELD_TICKER | BEARISH_SIGNAL/NONE | signal (1 sentence)"""
+
     search_prompt = f"""Scan X and web RIGHT NOW for trading signals. Date: {datetime.datetime.now():%b %d %Y %H:%M ET}
 
 First, report QQQ (Nasdaq 100 ETF) today's % change so far: QQQ | +X.XX% or -X.XX%
@@ -202,7 +209,7 @@ For each ticker report ONE line:
 TICKER | BULLISH/BEARISH/NEUTRAL/NODATA | HIGH/MEDIUM/LOW | top signal (1 sentence) | hard news if any
 
 Priority signals: options flow, short squeeze, insider buy, earnings/guidance, analyst upgrade, product launch.
-Look back {lookback_hrs}h max, prefer last 30min. Stale posts with no corroboration = NODATA."""
+Look back {lookback_hrs}h max, prefer last 30min. Stale posts with no corroboration = NODATA.{held_section}"""
 
     try:
         search_response = ctx.client.responses.create(
@@ -224,7 +231,7 @@ Look back {lookback_hrs}h max, prefer last 30min. Stale posts with no corroborat
 
     except Exception as e:
         log(f"Grok search error: {e}", "error")
-        return None
+        return None, ""
 
     # ──────────────────────────────────────────────────────────────────────────
     # PASS B — pure reasoning, no search tools
@@ -260,6 +267,7 @@ Score each stock 1-10:
 0: BEARISH or NODATA → skip
 
 Only allocate to score ≥{min_score}. Decide how many USD to put into each qualifying stock — use your judgment based on signal strength. You don't have to use the full budget. Spread across multiple stocks if warranted.
+IMPORTANT: Each allocation must be enough to buy at least 1 share. If the budget is small, concentrate on fewer stocks rather than splitting so thinly that no shares can be purchased. For example if budget is $1000 and GOOGL is $400, allocate at least $400 to GOOGL or skip it entirely.
 
 Return ONLY valid JSON, no markdown, no extra keys, no trailing text. Use ONLY watchlist tickers as keys:
 {{"conviction":{{"NVDA":0,"GOOGL":0}},"reasoning":["NVDA (0/10): reason"],"usd_allocation":{{"NVDA":0,"GOOGL":0}}}}
@@ -282,14 +290,14 @@ Return ONLY valid JSON, no markdown, no extra keys, no trailing text. Use ONLY w
         if not match:
             log(f"Pass B ({reasoning_model}) returned no JSON — full output:\n{content}", "error")
             log("  Falling back to hold-only mode (no new buys this cycle).", "warning")
-            return None
+            return None, raw_news
 
         try:
             data = json.loads(match.group())
         except json.JSONDecodeError as je:
             log(f"Pass B ({reasoning_model}) returned invalid JSON: {je}\n{match.group()}", "error")
             log("  Falling back to hold-only mode (no new buys this cycle).", "warning")
-            return None
+            return None, raw_news
 
         conviction = data.get("conviction", {})
         reasoning  = data.get("reasoning", [])
@@ -320,69 +328,35 @@ Return ONLY valid JSON, no markdown, no extra keys, no trailing text. Use ONLY w
 
         if not result:
             log("  No qualifying signals this cycle.")
-            return None
+            return None, raw_news
 
         log(f"  Qualifying signals: {list(result.keys())}")
         result["_reasoning"] = reasoning
-        return result
+        result["_conviction"] = {t: conviction.get(t, 0) for t in result if not t.startswith("_")}
+        return result, raw_news
 
     except Exception as e:
         log(f"Grok analysis error: {e}", "error")
-        return None
+        return None, raw_news
 
 
 async def get_sl_adjustments(
     ctx: AppContext,
     held_positions: dict,
     cfg: dict,
+    raw_news: str = "",
 ) -> dict:
     """
-    Every cycle, for each held position: scan fresh news and ask Claude
-    whether to tighten the SL based on sentiment shift.
+    Ask Claude whether to tighten SL or exit immediately for held positions.
 
     held_positions: {ticker: {"qty": int, "entry": float, "current_price": float, "sl": float, "tp": float}}
 
-    Returns {ticker: new_sl_price} only for tickers where SL should change.
-    Tickers not in the result = leave SL unchanged.
-    TP is never touched here — we let winners run.
+    Returns {ticker: {"sl": float | None, "exit": bool}}
+      - sl: new SL price, or None = no change
+      - exit: True = market-sell immediately (strong bearish catalyst)
+    Tickers not in result = no action.
     """
-    if not held_positions:
-        return {}
-
-    gcfg = cfg.get("grok", {})
-
-    search_targets = "\n".join(
-        f"  {t}: X cashtag {TICKERS_CONTEXT[t][0]}, keywords: {TICKERS_CONTEXT[t][1]}"
-        for t in held_positions if t in TICKERS_CONTEXT
-    )
-
-    search_prompt = f"""Scan X and web RIGHT NOW for news on these held stock positions. Date: {datetime.datetime.now():%b %d %Y %H:%M ET}
-
-{search_targets}
-
-For each ticker report ONE line:
-TICKER | BULLISH/BEARISH/NEUTRAL | HIGH/MEDIUM/LOW | key signal in last 30 min (1 sentence)
-
-Focus on: any negative catalysts, earnings warnings, analyst downgrades, macro headwinds, sector rotation, unusual selling pressure."""
-
-    raw_news = ""
-    try:
-        search_response = ctx.client.responses.create(
-            model=gcfg.get("model", "grok-4"),
-            input=[{"role": "user", "content": sanitize(search_prompt)}],
-            tools=[
-                {"type": "x_search"},
-                {"type": "web_search", "allowed_domains": [
-                    "reuters.com", "bloomberg.com", "cnbc.com", "sec.gov", "stocktwits.com"
-                ]},
-            ],
-        )
-        raw_news = search_response.output_text
-        log("SL NEWS SCAN:")
-        for line in raw_news.strip().splitlines():
-            log(f"  {line}")
-    except Exception as e:
-        log(f"SL scan error: {e} — skipping SL adjustment this cycle.", "warning")
+    if not held_positions or not raw_news:
         return {}
 
     positions_lines = "\n".join(
@@ -399,24 +373,35 @@ HELD POSITIONS:
 LIVE NEWS:
 {raw_news}
 
-Rules:
-- Only tighten SL if there is a STRONG and SPECIFIC bearish catalyst: analyst downgrade with price target cut, earnings warning, SEC filing, major negative news on CNBC/Reuters/Bloomberg, or confirmed institutional selling.
-- Do NOT tighten SL for: vague bearish sentiment, technical analysis opinions, minor dips, "may give up gains" type commentary, or anything speculative.
-- If you do tighten: new SL must be at least 2% below current price — never closer (gives room to breathe)
-- If news is BULLISH, NEUTRAL, or only mildly bearish → return null (no change)
-- Never widen SL (only tighten or keep same)
-- TP is never changed — leave it alone
-- When in doubt → return null. It is better to leave the SL unchanged than to tighten prematurely.
+Decide for each position: tighten SL or do nothing. Never exit mid-session — let the SL handle it.
 
-Return ONLY valid JSON with new SL prices for tickers that need adjustment. Use null for no change:
-{{"AMD": 338.50, "GOOGL": null}}
+IMPORTANT: Only act on news from TODAY ({datetime.datetime.now():%Y-%m-%d}). Ignore any article or post dated before today — treat it as null regardless of content.
+
+TIGHTEN SL AGGRESSIVELY (tight: true) — strong bearish catalyst:
+- Earnings warning / guidance cut confirmed by major outlet
+- Double downgrade with large PT cut (>20%)
+- SEC investigation, CEO resignation, breaking fundamental bad news
+- Set new SL 1% below current price — very tight, price will hit it fast if news is real
+
+TIGHTEN SL MODERATELY (tight: false) — moderate bearish news:
+- Single analyst downgrade with PT cut
+- Sector weakness confirmed by multiple sources
+- Set new SL 2% below current price
+
+DO NOTHING (null) — anything else:
+- Vague sentiment, technical opinions, minor dips, speculative commentary
+- BULLISH or NEUTRAL news
+- When in doubt → null
+
+Return ONLY valid JSON. Use null for no action:
+{{"AMD": {{"sl": 338.50, "tight": true}}, "GOOGL": {{"sl": 395.00, "tight": false}}, "NVDA": null}}
 """
 
     try:
         model    = cfg.get("claude", {}).get("model", "claude-sonnet-4-6")
         response = ctx.claude.messages.create(
             model=model,
-            max_tokens=300,
+            max_tokens=400,
             messages=[{"role": "user", "content": prompt}],
         )
         content = response.content[0].text
@@ -426,15 +411,152 @@ Return ONLY valid JSON with new SL prices for tickers that need adjustment. Use 
             log("SL adjustment: no JSON returned — keeping existing stops.", "warning")
             return {}
         raw = json.loads(match.group())
-        result = {t: v for t, v in raw.items() if v is not None and isinstance(v, (int, float))}
+
+        result = {}
+        for t, v in raw.items():
+            if v is None:
+                continue
+            if isinstance(v, dict):
+                sl    = v.get("sl")
+                tight = bool(v.get("tight", False))
+                if sl is not None:
+                    result[t] = {"sl": sl, "tight": tight}
+            elif isinstance(v, (int, float)):
+                result[t] = {"sl": float(v), "tight": False}
+
         if result:
             log("SL ADJUSTMENTS:")
-            for ticker, new_sl in result.items():
+            for ticker, action in result.items():
                 old_sl = held_positions.get(ticker, {}).get("sl", 0)
-                log(f"  {ticker}: SL ${old_sl:.2f} → ${new_sl:.2f}")
+                label  = "AGGRESSIVE" if action["tight"] else "moderate"
+                log(f"  {ticker}: {label} tighten SL ${old_sl:.2f} → ${action['sl']:.2f}")
         else:
             log("  SL scan: no adjustments needed this cycle.")
         return result
     except Exception as e:
         log(f"SL adjustment error: {e}", "error")
+        return {}
+
+
+async def get_premarket_scan(
+    ctx: AppContext,
+    held_positions: dict,
+    cfg: dict,
+) -> dict:
+    """
+    Pre-market scan — runs ~30 min before open (9:00 AM ET).
+    One Grok news call on held positions, Claude decides per ticker:
+      "hold" | "sell_at_open" | "tighten_sl"
+
+    held_positions: {ticker: {"qty": int, "entry": float, "sl": float, "tp": float}}
+    Returns {ticker: {"action": str, "new_sl": float | None}}
+    """
+    if not held_positions:
+        return {}
+
+    gcfg = cfg.get("grok", {})
+    tickers = list(held_positions.keys())
+
+    search_targets = "\n".join(
+        f"  {t}: X cashtag {TICKERS_CONTEXT[t][0]}, keywords: {TICKERS_CONTEXT[t][1]}"
+        for t in tickers if t in TICKERS_CONTEXT
+    )
+
+    search_prompt = f"""Pre-market research for held stock positions. Date: {datetime.datetime.now():%b %d %Y %H:%M ET}
+Market opens in ~30 minutes. Research overnight and pre-market news for these positions:
+
+{search_targets}
+
+For each ticker report:
+TICKER | BULLISH/BEARISH/NEUTRAL | any major overnight event (earnings, guidance, downgrade, SEC, CEO news, macro) | pre-market price move if available
+
+Focus on: overnight earnings releases, analyst actions, SEC filings, macro events (Fed, CPI), pre-market price action.
+Look back 12 hours."""
+
+    raw_news = ""
+    try:
+        search_response = ctx.client.responses.create(
+            model=gcfg.get("model", "grok-4"),
+            input=[{"role": "user", "content": sanitize(search_prompt)}],
+            tools=[
+                {"type": "x_search"},
+                {"type": "web_search", "allowed_domains": ["reuters.com", "bloomberg.com", "cnbc.com", "sec.gov", "stocktwits.com"]},
+            ],
+        )
+        raw_news = search_response.output_text
+        log("PRE-MARKET SCAN:")
+        for line in raw_news.strip().splitlines():
+            log(f"  {line}")
+    except Exception as e:
+        log(f"Pre-market Grok scan error: {e}", "warning")
+        return {}
+
+    positions_lines = "\n".join(
+        f"  {t}: {info['qty']}sh @ ${info['entry']:.2f} | SL=${info['sl']:.2f} | TP={info.get('tp', 0):.2f}"
+        for t, info in held_positions.items()
+    )
+
+    prompt = f"""You are deciding what to do with held stock positions at market open. Date: {datetime.datetime.now():%b %d %Y %H:%M ET}
+
+HELD POSITIONS:
+{positions_lines}
+
+OVERNIGHT / PRE-MARKET NEWS:
+{raw_news}
+
+For each position choose ONE action:
+
+"sell_at_open" — sell immediately when market opens. Use for:
+  - Earnings miss / guidance cut confirmed
+  - SEC investigation, fraud, CEO resignation
+  - Double downgrade with large PT cut (>20%)
+  - Strong gap-down pre-market (>3%) with confirmed bad news
+  - Any event that fundamentally changes the investment thesis negatively
+
+"tighten_sl" — keep position but move SL closer. Use for:
+  - Single downgrade, mild negative news, sector weakness
+  - Small pre-market gap-down (<3%) with uncertain cause
+  - Provide new_sl at least 2% below current/pre-market price
+
+"hold" — no change. Use for:
+  - Bullish or neutral news
+  - No significant overnight events
+  - When in doubt → hold
+
+Return ONLY valid JSON:
+{{"AMD": {{"action": "hold", "new_sl": null}}, "NVDA": {{"action": "sell_at_open", "new_sl": null}}, "GOOGL": {{"action": "tighten_sl", "new_sl": 385.00}}}}
+"""
+
+    try:
+        model    = cfg.get("claude", {}).get("model", "claude-sonnet-4-6")
+        response = ctx.claude.messages.create(
+            model=model,
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        content = response.content[0].text
+        clean   = re.sub(r'```(?:json)?|```', '', content).strip()
+        match   = re.search(r'\{.*\}', clean, re.DOTALL)
+        if not match:
+            log("Pre-market scan: no JSON returned — defaulting to hold all.", "warning")
+            return {}
+        data = json.loads(match.group())
+
+        result = {}
+        for ticker, v in data.items():
+            if not isinstance(v, dict):
+                continue
+            action  = v.get("action", "hold")
+            new_sl  = v.get("new_sl")
+            result[ticker] = {"action": action, "new_sl": new_sl}
+            if action == "sell_at_open":
+                log(f"  {ticker}: SELL AT OPEN — flagged by pre-market scan")
+            elif action == "tighten_sl" and new_sl:
+                log(f"  {ticker}: tighten SL → ${new_sl:.2f} at open")
+            else:
+                log(f"  {ticker}: hold — no action needed")
+        return result
+
+    except Exception as e:
+        log(f"Pre-market scan Claude error: {e}", "error")
         return {}

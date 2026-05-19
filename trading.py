@@ -90,7 +90,7 @@ async def check_for_stopouts(ctx: AppContext, risk: RiskGuard, prev_positions: d
     return current_positions
 
 
-async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg: dict, reasoning: list = None):
+async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg: dict, reasoning: list = None, raw_news: str = ""):
     """
     Main trading loop — called every cycle with Grok's allocation dict.
 
@@ -155,19 +155,66 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
 
         if action == 'BUY':
             open_buys.setdefault(sym, []).append(t)
-        elif action == 'SELL' and otype in ('STP', 'LMT'):
-            open_protection.setdefault(sym, {})[otype] = t
+        elif action == 'SELL' and otype == 'STP':
+            open_protection.setdefault(sym, {})['STP'] = t
+        elif action == 'SELL' and otype == 'LMT':
+            # Keep the first LMT found (oldest); multiple LMTs = TP already exists
+            open_protection.setdefault(sym, {}).setdefault('LMT', t)
 
     held_tickers = {sym for sym, qty in positions.items() if qty > 0 and sym in cfg["watchlist"]}
-    all_tickers  = {t: strategy.get(t, 0) for t in (set(strategy.keys()) | held_tickers)}
+    all_tickers  = {t: strategy.get(t, 0) for t in (set(strategy.keys()) | held_tickers) if not t.startswith("_")}
 
-    # News-driven SL adjustment — scan fresh news for all held positions every cycle.
+    # Budget culling — if we can't afford shares in all new-buy candidates, drop the
+    # lowest-conviction one and redistribute budget equally until everyone can be bought.
+    # Held positions and tickers with pct=0 are excluded from culling.
+    conviction_map = strategy.get("_conviction", {})
+    new_buy_candidates = [
+        t for t, pct in all_tickers.items()
+        if pct > 0 and t not in held_tickers and t not in risk.session_trades
+        and not t.startswith("_")
+    ]
+    if new_buy_candidates and investable > 0:
+        # Fetch prices for candidates to check affordability
+        prices_for_cull: dict[str, float] = {}
+        for t in new_buy_candidates:
+            try:
+                c = Stock(t, 'SMART', 'USD')
+                await ctx.ib.qualifyContractsAsync(c)
+                ctx.ib.reqMarketDataType(1)
+                [td] = await ctx.ib.reqTickersAsync(c)
+                p = td.marketPrice() or td.last or td.close
+                if p and p > 0:
+                    prices_for_cull[t] = p
+            except Exception:
+                pass
+
+        candidates = [t for t in new_buy_candidates if t in prices_for_cull]
+        while len(candidates) > 1:
+            equal_slice = investable / len(candidates)
+            if all(equal_slice >= prices_for_cull[t] for t in candidates):
+                break  # everyone can afford at least 1 share
+            # Drop the lowest-conviction candidate
+            candidates.sort(key=lambda t: conviction_map.get(t, 0))
+            dropped = candidates.pop(0)
+            log(f"  Budget cull: dropping {dropped} (conviction {conviction_map.get(dropped, 0)}) — "
+                f"${investable:.0f} budget spread too thin across {len(candidates)+1} tickers.")
+        # Check if even the last one is affordable
+        if len(candidates) == 1 and investable < prices_for_cull[candidates[0]]:
+            log(f"  Budget cull: only {candidates[0]} left but ${investable:.0f} < ${prices_for_cull[candidates[0]]:.0f}/sh — no new buys.")
+            candidates = []
+
+        # Remove culled tickers from all_tickers (held tickers stay)
+        culled = set(new_buy_candidates) - set(candidates)
+        for t in culled:
+            all_tickers.pop(t, None)
+
+    # News-driven SL adjustment — uses news already fetched by get_grok_strategy (no extra Grok call).
     # Tightens SL if sentiment has turned bearish. TP is never touched.
     # TO DISABLE: remove this block and set sl_adjustments = {}
     # TO CHANGE sensitivity: edit the Rules section in get_sl_adjustments() prompt in strategy.py
     # TO CHANGE minimum SL distance: edit the 0.98 multiplier below (default 2% away from price)
     sl_adjustments: dict[str, float] = {}
-    if held_tickers:
+    if held_tickers and raw_news:
         held_info = {}
         for sym in held_tickers:
             session = risk.session_trades.get(sym)
@@ -187,7 +234,7 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
                     "tp":            session.get("tp", 0),
                 }
         if held_info:
-            sl_adjustments = await get_sl_adjustments(ctx, held_info, cfg)
+            sl_adjustments = await get_sl_adjustments(ctx, held_info, cfg, raw_news=raw_news)
 
     for ticker, pct in all_tickers.items():
         if ticker not in cfg["watchlist"]:
@@ -231,6 +278,18 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
             existing_stp = open_protection.get(ticker, {}).get('STP')
             existing_lmt = open_protection.get(ticker, {}).get('LMT')
 
+            # Count qty already covered by live SELL orders so we never submit
+            # more sell qty than we hold — cash accounts reject that as a short.
+            all_open = await ctx.ib.reqAllOpenOrdersAsync()
+            live_sell_qty = sum(
+                int(t.order.totalQuantity)
+                for t in all_open
+                if t.contract.symbol == ticker
+                and t.order.action.upper() == 'SELL'
+                and t.orderStatus.status not in ('Cancelled', 'Filled', 'Inactive', 'PendingCancel')
+            )
+            safe_qty = max(0, current_qty - live_sell_qty)
+
             if existing_stp:
                 current_sl  = existing_stp.order.auxPrice
                 trailing_sl = round(price - sl_distance, 2)
@@ -238,36 +297,43 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
                 if trailing_sl > current_sl * (1 + cfg["atr"]["sl_update_min_pct"]):
                     log(f"  {ticker}: trailing stop ${current_sl:.2f} → ${trailing_sl:.2f} (all {current_qty}sh)")
                     ctx.ib.cancelOrder(existing_stp.order)
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(1.5)
                     new_sl          = StopOrder('SELL', current_qty, trailing_sl, account=ctx.ib_acc, tif='GTC')
                     new_sl.transmit = True
                     ctx.ib.placeOrder(contract, new_sl)
                 else:
                     log(f"  {ticker}: stop ${current_sl:.2f} still valid — not lowering.")
-            else:
+            elif safe_qty > 0:
                 sl_price = round(price - sl_distance, 2)
                 sl_price = max(sl_price, min_sl)
-                log(f"  {ticker}: no SL found — placing SL=${sl_price} for all {current_qty}sh")
-                new_sl          = StopOrder('SELL', current_qty, sl_price, account=ctx.ib_acc, tif='GTC')
+                log(f"  {ticker}: no SL found — placing SL=${sl_price} for {safe_qty}sh")
+                new_sl          = StopOrder('SELL', safe_qty, sl_price, account=ctx.ib_acc, tif='GTC')
                 new_sl.transmit = True
                 ctx.ib.placeOrder(contract, new_sl)
+            else:
+                log(f"  {ticker}: SL already fully covered by live orders — skipping.")
 
             if not existing_lmt and existing_stp:
-                tp_price  = round(price + tp_distance, 2)
-                oca_group = f"OCA_{ticker}_{int(asyncio.get_event_loop().time())}"
-                log(f"  {ticker}: no TP found — placing TP=${tp_price} for all {current_qty}sh (OCA with SL)")
-                ctx.ib.cancelOrder(existing_stp.order)
-                await asyncio.sleep(0.3)
-                new_sl          = StopOrder('SELL', current_qty, existing_stp.order.auxPrice, account=ctx.ib_acc, tif='GTC')
-                new_sl.ocaGroup = oca_group
-                new_sl.ocaType  = 1
-                new_sl.transmit = True
-                new_tp          = LimitOrder('SELL', current_qty, tp_price, account=ctx.ib_acc, tif='GTC')
-                new_tp.ocaGroup = oca_group
-                new_tp.ocaType  = 1
-                new_tp.transmit = True
-                ctx.ib.placeOrder(contract, new_sl)
-                ctx.ib.placeOrder(contract, new_tp)
+                # SL exists but no LMT in our snapshot — check actual live sell qty
+                # before placing a TP. IBKR may have a LMT from a prior session that
+                # wasn't picked up (e.g. multiple LMTs, only last one stored).
+                all_open_now = await ctx.ib.reqAllOpenOrdersAsync()
+                live_lmt_qty = sum(
+                    int(t.order.totalQuantity)
+                    for t in all_open_now
+                    if t.contract.symbol == ticker
+                    and t.order.action.upper() == 'SELL'
+                    and t.order.orderType.upper() == 'LMT'
+                    and t.orderStatus.status not in ('Cancelled', 'Filled', 'Inactive', 'PendingCancel')
+                )
+                if live_lmt_qty >= current_qty:
+                    log(f"  {ticker}: TP already covered by {live_lmt_qty}sh live LMT — skipping.")
+                else:
+                    tp_price = round(price + tp_distance, 2)
+                    log(f"  {ticker}: no TP found — placing standalone TP=${tp_price} for {current_qty}sh")
+                    new_tp          = LimitOrder('SELL', current_qty, tp_price, account=ctx.ib_acc, tif='GTC')
+                    new_tp.transmit = True
+                    ctx.ib.placeOrder(contract, new_tp)
             elif not existing_lmt and not existing_stp:
                 log(f"  {ticker}: no SL yet — TP will be placed next cycle once SL is confirmed.")
             else:
@@ -286,14 +352,15 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
             target_qty = session_qty
             log(f"  {ticker}: Grok has no buy signal but we hold — keeping {session_qty}sh.")
         else:
-            target_value = (pct / 100) * investable
-            target_qty   = int(target_value / price)
-            # Never trim below what we originally bought this session.
-            # The free budget shrinks as we buy more tickers, which would make
-            # earlier positions look "over target" and trigger spurious trims.
-            # SL/TP protect the downside — let them do their job.
-            if in_session:
-                target_qty = max(target_qty, session_qty)
+            # Additive: how many MORE shares to buy with this ticker's free-cash slice.
+            # We never reduce a session position via budget math — only SL/TP/EOD do that.
+            slice_budget = (pct / 100) * investable
+            extra_qty    = int(slice_budget / price)
+            # If the per-ticker slice can't afford even 1 share but the full investable
+            # budget can, buy 1 share — don't leave cash idle on a high-conviction signal.
+            if extra_qty == 0 and investable >= price and pct > 0:
+                extra_qty = 1
+            target_qty = session_qty + extra_qty
         delta_qty = target_qty - session_qty
 
         has_sl = 'STP' in open_protection.get(ticker, {})
@@ -369,39 +436,50 @@ async def trade_rebalance(ctx: AppContext, strategy: dict, risk: RiskGuard, cfg:
             if delta_qty == 0 and has_sl:
                 existing_stp = open_protection[ticker]['STP']
                 current_sl   = existing_stp.order.auxPrice
+                # Use the existing stop's own quantity — never expand to current_qty
+                # which could include overnight shares with separate OCA orders
+                stop_qty     = int(existing_stp.order.totalQuantity) or protected_qty
                 trailing_sl  = round(price - sl_distance, 2)
                 trailing_sl  = max(trailing_sl, round(price * 0.93, 2))
 
                 if trailing_sl > current_sl * (1 + cfg["atr"]["sl_update_min_pct"]):
-                    log(f"  {ticker}: trailing stop ${current_sl:.2f} → ${trailing_sl:.2f} ({protected_qty}sh)")
+                    log(f"  {ticker}: trailing stop ${current_sl:.2f} → ${trailing_sl:.2f} ({stop_qty}sh)")
                     ctx.ib.cancelOrder(existing_stp.order)
-                    await asyncio.sleep(0.3)
-                    new_sl          = StopOrder('SELL', protected_qty, trailing_sl,
+                    await asyncio.sleep(1.5)
+                    new_sl          = StopOrder('SELL', stop_qty, trailing_sl,
                                                 account=ctx.ib_acc, tif='GTC')
                     new_sl.transmit = True
                     ctx.ib.placeOrder(contract, new_sl)
                 else:
                     log(f"  {ticker}: stop ${current_sl:.2f} still valid — no update.")
 
-            # News-driven SL tighten — overrides ATR trailing if bearish signal found
+            # News-driven SL tighten — aggressive (1% floor) or moderate (2% floor)
             if ticker in sl_adjustments and has_sl:
-                news_sl      = round(sl_adjustments[ticker], 2)
+                adjustment   = sl_adjustments[ticker]
+                news_sl_raw  = adjustment.get("sl")
+                tight        = adjustment.get("tight", False)
                 existing_stp = open_protection.get(ticker, {}).get('STP')
-                current_sl   = existing_stp.order.auxPrice if existing_stp else 0
-                min_distance = round(price * 0.98, 2)  # hard floor: SL must be ≥2% below price
-                news_sl      = min(news_sl, min_distance)  # never closer than 1.5%
-                # Only apply if tighter than current SL and safely below current price
-                if news_sl > current_sl and news_sl < price:
-                    log(f"  {ticker}: NEWS tightening SL ${current_sl:.2f} → ${news_sl:.2f} (min distance enforced)")
-                    if existing_stp:
-                        ctx.ib.cancelOrder(existing_stp.order)
-                        await asyncio.sleep(0.3)
-                    new_sl          = StopOrder('SELL', protected_qty, news_sl, account=ctx.ib_acc, tif='GTC')
-                    new_sl.transmit = True
-                    ctx.ib.placeOrder(contract, new_sl)
-                    risk.session_trades[ticker]['sl'] = news_sl
-                elif news_sl <= current_sl:
-                    log(f"  {ticker}: news SL ${news_sl:.2f} not tighter than current ${current_sl:.2f} — keeping.")
+
+                if news_sl_raw:
+                    news_sl      = round(news_sl_raw, 2)
+                    current_sl   = existing_stp.order.auxPrice if existing_stp else 0
+                    # Floor: never closer than 1×ATR (aggressive) or 1.5×ATR (moderate)
+                    atr_mult     = 1.0 if tight else 1.5
+                    min_distance = round(price - atr_mult * atr, 2)
+                    news_sl      = max(news_sl, min_distance)
+                    stop_qty     = int(existing_stp.order.totalQuantity) if existing_stp else protected_qty
+                    label        = "AGGRESSIVE" if tight else "moderate"
+                    if news_sl > current_sl and news_sl < price:
+                        log(f"  {ticker}: NEWS {label} tighten SL ${current_sl:.2f} → ${news_sl:.2f}")
+                        if existing_stp:
+                            ctx.ib.cancelOrder(existing_stp.order)
+                            await asyncio.sleep(1.5)
+                        new_sl          = StopOrder('SELL', stop_qty, news_sl, account=ctx.ib_acc, tif='GTC')
+                        new_sl.transmit = True
+                        ctx.ib.placeOrder(contract, new_sl)
+                        risk.session_trades[ticker]['sl'] = news_sl
+                    elif news_sl <= current_sl:
+                        log(f"  {ticker}: news SL ${news_sl:.2f} not tighter than current ${current_sl:.2f} — keeping.")
 
             elif delta_qty == 0 and not has_sl:
                 log(f"  {ticker}: position unprotected — attaching SL+TP now.")

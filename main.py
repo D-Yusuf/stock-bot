@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import os
 import socket
 import subprocess
 import time
@@ -11,12 +12,12 @@ from helpers import (
 )
 from account import get_total_capital
 from risk import RiskGuard
-from strategy import get_grok_strategy, get_hold_overnight_flags
+from strategy import get_grok_strategy, get_hold_overnight_flags, get_premarket_scan
 from trading import trade_rebalance, close_all_positions, check_for_stopouts
 
 
 TWS_APP = "/Users/mac/Applications/Trader Workstation/Trader Workstation.app"
-_TWS_LAUNCH_TIMEOUT = 120  # seconds to wait for TWS to open its API port
+_TWS_LAUNCH_TIMEOUT = 300  # seconds to wait for TWS login + phone approval
 
 
 def _tws_port_open() -> bool:
@@ -36,30 +37,22 @@ def _tws_process_running() -> bool:
         return False
 
 
+_VENV_PYTHON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv", "bin", "python3")
+
+
 def _ensure_tws_running():
     if _tws_port_open():
         log("TWS API port is open — already running.")
         return
 
-    if not _tws_process_running():
-        log("TWS not running — launching Trader Workstation...")
-        subprocess.Popen(["open", "-a", TWS_APP])
-    else:
-        log("TWS process found but API port not yet open — waiting for API to start...")
-
-    log(f"Waiting up to {_TWS_LAUNCH_TIMEOUT}s for TWS API port {IB_PORT}...")
-    deadline = time.time() + _TWS_LAUNCH_TIMEOUT
-    while time.time() < deadline:
-        if _tws_port_open():
-            log("TWS API port is now open.")
-            return
-        time.sleep(3)
-
-    raise RuntimeError(
-        f"TWS did not open API port {IB_PORT} within {_TWS_LAUNCH_TIMEOUT}s. "
-        "Check that 'Enable ActiveX and Socket Clients' is enabled in TWS API settings "
-        "and Socket port matches IB_PORT in .env."
-    )
+    log("TWS not ready — running auto-login...")
+    login_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tws_login.py")
+    result = subprocess.run([_VENV_PYTHON, login_script])
+    if result.returncode != 0 or not _tws_port_open():
+        raise RuntimeError(
+            f"TWS did not open API port {IB_PORT} within timeout. "
+            "Check TWS is running and API is enabled, or log in manually first via the dashboard."
+        )
 
 
 def _print_banner():
@@ -343,6 +336,44 @@ async def main():
 
             if not is_market_open():
                 secs_left = next_market_open_secs()
+
+                # Pre-market scan — fires once when 25-35 min from open
+                # Uses ALL held IBKR positions, not just session_trades
+                if 25 * 60 <= secs_left <= 35 * 60:
+                    already_scanned = getattr(risk, '_premarket_scanned_date', None)
+                    if already_scanned != datetime.date.today():
+                        _positions_snap = {p.contract.symbol: p.position
+                                           for p in await ctx.ib.reqPositionsAsync()}
+                        held_for_scan = {}
+                        for sym, qty in _positions_snap.items():
+                            if qty > 0 and sym in watchlist:
+                                session = risk.session_trades.get(sym)
+                                held_for_scan[sym] = {
+                                    "qty":   int(qty),
+                                    "entry": session["fill_price"] if session else 0,
+                                    "sl":    session["sl"] if session else 0,
+                                    "tp":    session.get("tp", 0) if session else 0,
+                                }
+                        if held_for_scan:
+                            log(f"  PRE-MARKET SCAN — checking overnight news on {', '.join(held_for_scan)}...")
+                            pm_flags = await get_premarket_scan(ctx, held_for_scan, cfg)
+                            from risk import _save_session_trades as _save_st
+                            for ticker, decision in pm_flags.items():
+                                if ticker not in risk.session_trades:
+                                    # create minimal entry so premarket flags can be stored
+                                    risk.session_trades[ticker] = {
+                                        "qty": held_for_scan[ticker]["qty"],
+                                        "fill_price": held_for_scan[ticker]["entry"],
+                                        "sl": held_for_scan[ticker]["sl"],
+                                        "tp": held_for_scan[ticker]["tp"],
+                                        "entry_dt": datetime.datetime.now().isoformat(),
+                                    }
+                                risk.session_trades[ticker]['premarket_action'] = decision['action']
+                                if decision.get('new_sl'):
+                                    risk.session_trades[ticker]['premarket_new_sl'] = decision['new_sl']
+                            _save_st(risk.session_trades)
+                        risk._premarket_scanned_date = datetime.date.today()
+
                 while secs_left > 0:
                     if helpers.shutdown_requested:
                         break
@@ -357,38 +388,87 @@ async def main():
 
             else:
                 from account import get_available_cash
+                from ib_async import Stock, MarketOrder as _MarketOrder, StopOrder as _StopOrder
+
+                # Execute pre-market sell-at-open flags on first cycle after open
+                for ticker, session in list(risk.session_trades.items()):
+                    action = session.pop('premarket_action', None)
+                    new_sl = session.pop('premarket_new_sl', None)
+                    if action == 'sell_at_open':
+                        _positions_snap = {p.contract.symbol: p.position
+                                           for p in await ctx.ib.reqPositionsAsync()}
+                        qty = int(_positions_snap.get(ticker, 0))
+                        if qty <= 0:
+                            log(f"  {ticker}: sell_at_open flagged but no shares held — skipping.")
+                            risk.close_session_trade(ticker)
+                            continue
+                        log(f"  {ticker}: SELL AT OPEN — executing {qty}sh (pre-market flag)")
+                        contract = Stock(ticker, 'SMART', 'USD')
+                        await ctx.ib.qualifyContractsAsync(contract)
+                        # Cancel existing SL/TP first
+                        for t in await ctx.ib.reqAllOpenOrdersAsync():
+                            if t.contract.symbol == ticker and t.order.action == 'SELL':
+                                ctx.ib.cancelOrder(t.order)
+                        await asyncio.sleep(0.5)
+                        sell_order          = _MarketOrder('SELL', qty, account=ctx.ib_acc)
+                        sell_order.tif      = 'DAY'
+                        sell_order.transmit = True
+                        ctx.ib.placeOrder(contract, sell_order)
+                        log(f"  {ticker}: sell-at-open order placed.")
+                        risk.close_session_trade(ticker)
+                    elif action == 'tighten_sl' and new_sl:
+                        log(f"  {ticker}: applying pre-market SL tighten → ${new_sl:.2f}")
+                        risk.session_trades[ticker]['sl'] = new_sl
+                        from risk import _save_session_trades as _save_st
+                        _save_st(risk.session_trades)
+
+                import zoneinfo as _zi
 
                 eod_cfg    = cfg.get("eod", {})
-                close_mins = eod_cfg.get("close_minutes_before", 10)
+                close_mins = eod_cfg.get("close_minutes_before", 15)
 
-                # If EOD window is approaching but hasn't started yet, wait for it
-                import zoneinfo as _zi
+                # If EOD window is <2 min away but not yet started, wait for it so the
+                # Grok scan can't eat into it.  Check this BEFORE cash calculations.
                 _et_now    = datetime.datetime.now(datetime.timezone.utc).astimezone(_zi.ZoneInfo("America/New_York"))
                 _et_close  = _et_now.replace(hour=16, minute=0, second=0, microsecond=0)
                 _eod_start = _et_close - datetime.timedelta(minutes=close_mins)
                 _secs_to_eod = (_eod_start - _et_now).total_seconds()
                 if 0 < _secs_to_eod < 120:
-                    log(f"  EOD window in {int(_secs_to_eod)}s — waiting...")
+                    log(f"  EOD window in {int(_secs_to_eod)}s — waiting before scan...")
                     await asyncio.sleep(_secs_to_eod + 5)
+                    # Recompute after wait
+                    _et_now = datetime.datetime.now(datetime.timezone.utc).astimezone(_zi.ZoneInfo("America/New_York"))
 
-                eod_cfg     = cfg.get("eod", {})
-                close_mins  = eod_cfg.get("close_minutes_before", 15)
-
-                # EOD close — 15 min before market close on any day
+                # EOD close — before market close on any day (checked BEFORE Grok scan)
                 if eod_cfg.get("close_all_eod") and is_eod_close_window(close_mins):
                     log("  EOD window — asking Claude which positions to hold overnight...")
                     portfolio_items = {p.contract.symbol: p for p in ctx.ib.portfolio()}
-                    current_positions = {
-                        t: {"qty": s["qty"], "entry": s["fill_price"],
-                            "price": portfolio_items[t].marketPrice,
-                            "pnl":   portfolio_items[t].unrealizedPNL}
-                        for t, s in risk.session_trades.items()
-                        if t in portfolio_items and portfolio_items[t].position > 0
-                    }
+                    # Include ALL held positions, not just session_trades
+                    current_positions = {}
+                    for sym, item in portfolio_items.items():
+                        if item.position <= 0 or sym not in watchlist:
+                            continue
+                        session = risk.session_trades.get(sym)
+                        current_positions[sym] = {
+                            "qty":   int(item.position),
+                            "entry": session["fill_price"] if session else item.averageCost,
+                            "price": item.marketPrice,
+                            "pnl":   item.unrealizedPNL,
+                        }
                     flags = await get_hold_overnight_flags(ctx, current_positions, cfg)
                     for t, flag in flags.items():
                         if t in risk.session_trades:
                             risk.session_trades[t]['hold_overnight'] = flag
+                        else:
+                            # pre-existing position — create a minimal session entry so
+                            # close_all_positions can respect the hold_overnight flag
+                            risk.session_trades[t] = {
+                                "qty": current_positions[t]["qty"],
+                                "fill_price": current_positions[t]["entry"],
+                                "sl": 0, "tp": 0,
+                                "entry_dt": datetime.datetime.now().isoformat(),
+                                "hold_overnight": flag,
+                            }
                     await _refresh_overnight_sl_tp(ctx, risk, cfg, flags)
                     log("  Closing non-held positions before market close.")
                     await close_all_positions(ctx, watchlist, "end of day", risk)
@@ -398,21 +478,34 @@ async def main():
                     await asyncio.sleep(cfg["timing"]["cycle_seconds"])
                     continue
 
-                # Friday hard close — no weekend risk
+                # Friday hard close — no weekend risk (checked BEFORE Grok scan)
                 if eod_cfg.get("close_all_friday") and is_friday_eod(close_mins):
                     log("  Friday EOD — asking Claude which positions to hold over weekend...")
                     portfolio_items = {p.contract.symbol: p for p in ctx.ib.portfolio()}
-                    current_positions = {
-                        t: {"qty": s["qty"], "entry": s["fill_price"],
-                            "price": portfolio_items[t].marketPrice,
-                            "pnl":   portfolio_items[t].unrealizedPNL}
-                        for t, s in risk.session_trades.items()
-                        if t in portfolio_items and portfolio_items[t].position > 0
-                    }
+                    # Include ALL held positions, not just session_trades
+                    current_positions = {}
+                    for sym, item in portfolio_items.items():
+                        if item.position <= 0 or sym not in watchlist:
+                            continue
+                        session = risk.session_trades.get(sym)
+                        current_positions[sym] = {
+                            "qty":   int(item.position),
+                            "entry": session["fill_price"] if session else item.averageCost,
+                            "price": item.marketPrice,
+                            "pnl":   item.unrealizedPNL,
+                        }
                     flags = await get_hold_overnight_flags(ctx, current_positions, cfg, is_friday=True)
                     for t, flag in flags.items():
                         if t in risk.session_trades:
                             risk.session_trades[t]['hold_overnight'] = flag
+                        else:
+                            risk.session_trades[t] = {
+                                "qty": current_positions[t]["qty"],
+                                "fill_price": current_positions[t]["entry"],
+                                "sl": 0, "tp": 0,
+                                "entry_dt": datetime.datetime.now().isoformat(),
+                                "hold_overnight": flag,
+                            }
                     await _refresh_overnight_sl_tp(ctx, risk, cfg, flags)
                     log("  Closing non-held positions for weekend.")
                     await close_all_positions(ctx, watchlist, "Friday close", risk)
@@ -445,21 +538,49 @@ async def main():
                 MIN_BUY_BUDGET = 150.0
                 scan_budget = free_budget if free_budget >= MIN_BUY_BUDGET else 0.0
 
-                if scan_budget == 0.0:
-                    log("  No free cash to buy — skipping Grok scan, managing existing SL/TP only.")
+                # Build held_info for combined scan — ALL held IBKR positions,
+                # not just session_trades, so pre-existing positions get news evaluated too
+                held_info_for_scan = {}
+                _positions_snap = {p.contract.symbol: p.position for p in await ctx.ib.reqPositionsAsync()}
+                for sym, qty in _positions_snap.items():
+                    if qty > 0 and sym in watchlist:
+                        session = risk.session_trades.get(sym)
+                        held_info_for_scan[sym] = {
+                            "qty":           int(qty),
+                            "entry":         session["fill_price"] if session else 0,
+                            "current_price": session["fill_price"] if session else 0,
+                            "sl":            session["sl"] if session else 0,
+                            "tp":            session.get("tp", 0) if session else 0,
+                        }
+
+                if scan_budget == 0.0 and not held_info_for_scan:
+                    log("  No free cash and no held positions — skipping cycle.")
                     await trade_rebalance(ctx, {}, risk, cfg, [])
-                    log(f"Cycle done. Sleeping {cfg['timing']['cycle_seconds']}s...")
-                    await asyncio.sleep(cfg["timing"]["cycle_seconds"])
+                    # Still use smart sleep so EOD window isn't missed
+                    _et_now_s  = datetime.datetime.now(datetime.timezone.utc).astimezone(__import__('zoneinfo').ZoneInfo("America/New_York"))
+                    _et_cls_s  = _et_now_s.replace(hour=16, minute=0, second=0, microsecond=0)
+                    _eod_s     = _et_cls_s - datetime.timedelta(minutes=cfg.get("eod", {}).get("close_minutes_before", 15))
+                    _secs_eod  = (_eod_s - _et_now_s).total_seconds()
+                    if 0 < _secs_eod < cycle_secs:
+                        _sl = max(30, int(_secs_eod) - 10)
+                        log(f"Cycle done. EOD in {int(_secs_eod)}s — sleeping {_sl}s to catch window.")
+                        await asyncio.sleep(_sl)
+                    else:
+                        log(f"Cycle done. Sleeping {cycle_secs}s...")
+                        await asyncio.sleep(cycle_secs)
                     continue
 
-                raw = await get_grok_strategy(ctx, watchlist, conversation, cfg, scan_budget)
+                raw, raw_news = await get_grok_strategy(
+                    ctx, watchlist, conversation, cfg, scan_budget,
+                    held_positions=held_info_for_scan or None,
+                )
 
                 if raw:
                     reasoning = raw.pop("_reasoning", [])
-                    await trade_rebalance(ctx, raw, risk, cfg, reasoning)
+                    await trade_rebalance(ctx, raw, risk, cfg, reasoning, raw_news=raw_news)
                 else:
                     log("  No actionable signal.")
-                    await trade_rebalance(ctx, {}, risk, cfg, [])
+                    await trade_rebalance(ctx, {}, risk, cfg, [], raw_news=raw_news)
 
             # Sleep until next cycle, but wake up early if EOD window is approaching
             import zoneinfo as _zi

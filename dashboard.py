@@ -8,6 +8,7 @@ import subprocess
 import threading
 import json
 import os
+import sys
 
 PLIST_LABEL      = "com.stockbot"
 PLIST_PATH       = os.path.expanduser("~/Library/LaunchAgents/com.stockbot.plist")

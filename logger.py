@@ -6,7 +6,24 @@ from logging.handlers import RotatingFileHandler
 from config import BOT_DIR
 
 # ---------------------------------------------------------------------------
-# Rotating file handler
+# Noise filter — suppresses IBKR internal chatter from ib_async
+# ---------------------------------------------------------------------------
+_NOISE_PATTERNS = re.compile(
+    r'updatePortfolio:|orderStatus:|position:|execDetails:|'
+    r'commissionReport:|openOrder:|accountValue:|'
+    r'Warning \d+, reqId -1:|'
+    r'HTTP Request: (GET|POST) https://',
+    re.IGNORECASE,
+)
+
+
+class _BotFilter(logging.Filter):
+    def filter(self, record):
+        return not _NOISE_PATTERNS.search(record.getMessage())
+
+
+# ---------------------------------------------------------------------------
+# Rotating file handler — bot messages only, 2 MB × 3 backups
 # ---------------------------------------------------------------------------
 _handler = RotatingFileHandler(
     os.path.join(BOT_DIR, 'bot_activity.log'),
@@ -17,8 +34,19 @@ _handler.setFormatter(logging.Formatter(
     '%(asctime)s | %(levelname)s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
 ))
-logging.getLogger().setLevel(logging.INFO)
-logging.getLogger().addHandler(_handler)
+_handler.addFilter(_BotFilter())
+
+# Console handler — same filter, no timestamps (cleaner terminal output)
+_console = logging.StreamHandler()
+_console.setFormatter(logging.Formatter('%(message)s'))
+_console.addFilter(_BotFilter())
+
+root = logging.getLogger()
+root.setLevel(logging.INFO)
+# Remove any handlers added by ib_async or other libs before ours
+root.handlers.clear()
+root.addHandler(_handler)
+# Don't add a second console handler — log() calls print() directly
 
 _order_log_path = os.path.join(BOT_DIR, "orders.log")
 
@@ -65,10 +93,9 @@ def log_order(action: str, ticker: str, qty: int, price: float,
 
 
 # ---------------------------------------------------------------------------
-# Trade CSV logger — one row per closed trade for performance analysis
-# Opens in Excel/Sheets. Appended automatically, never overwritten.
+# Trade CSV logger — one row per closed trade, deduped on write
 # ---------------------------------------------------------------------------
-_CSV_PATH = os.path.join(BOT_DIR, "progress", "trades.csv")
+_CSV_PATH    = os.path.join(BOT_DIR, "progress", "trades.csv")
 _CSV_HEADERS = "date,ticker,entry_price,exit_price,qty,pnl,exit_reason,hold_minutes\n"
 
 
@@ -76,11 +103,23 @@ def log_trade_csv(ticker: str, entry_price: float, exit_price: float,
                   qty: int, exit_reason: str, entry_time: datetime.datetime,
                   commission: float = 0.0):
     os.makedirs(os.path.dirname(_CSV_PATH), exist_ok=True)
-    write_header = not os.path.exists(_CSV_PATH)
     hold_minutes = int((datetime.datetime.now() - entry_time).total_seconds() / 60)
     pnl          = round((exit_price - entry_price) * qty, 2)
     row = (f"{datetime.date.today()},{ticker},{entry_price:.2f},{exit_price:.2f},"
            f"{qty},{pnl:+.2f},{exit_reason},{hold_minutes}\n")
+
+    # Read existing rows to avoid duplicates
+    existing = set()
+    if os.path.exists(_CSV_PATH):
+        with open(_CSV_PATH) as f:
+            for line in f:
+                existing.add(line.strip())
+
+    if row.strip() in existing:
+        log(f"  CSV skip (duplicate): {ticker} {exit_reason}")
+        return
+
+    write_header = not os.path.exists(_CSV_PATH)
     with open(_CSV_PATH, "a") as f:
         if write_header:
             f.write(_CSV_HEADERS)

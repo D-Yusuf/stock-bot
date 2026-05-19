@@ -32,6 +32,9 @@ IB_PORT, IB_ACC, TRADING_MODE = _resolve_ib_settings()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
+TWS_USERNAME = os.getenv("TWS_USERNAME", "")
+TWS_PASSWORD = os.getenv("TWS_PASSWORD", "")
+
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
